@@ -35,6 +35,7 @@
          on_down/2,
          send_message/2,
          forward_message/3,
+         cast_message/3,
          receive_message/1,
          decode/1,
          reserve/1,
@@ -96,6 +97,10 @@ send_message(Name, Message) ->
 %% @doc Forward message to registered process on the remote side.
 forward_message(Name, ServerRef, Message) ->
     gen_server:call(?MODULE, {forward_message, Name, ServerRef, Message}, infinity).
+
+%% @doc Cast message to registered process on the remote side.
+cast_message(Name, ServerRef, Message) ->
+    gen_server:cast(?MODULE, {cast_message, Name, ServerRef, Message}).
 
 %% @doc Receive message from a remote manager.
 receive_message(Message) ->
@@ -248,6 +253,11 @@ handle_call(Msg, _From, State) ->
 
 %% @private
 -spec handle_cast(term(), state_t()) -> {noreply, state_t()}.
+
+handle_cast({cast_message, Name, ServerRef, Message}, #state{connections=Connections}=State) ->
+    do_send_message(Name, {forward_message, ServerRef, Message}, Connections),
+    {noreply, State};
+
 handle_cast(Msg, State) ->
     lager:warning("Unhandled messages: ~p", [Msg]),
     {noreply, State}.

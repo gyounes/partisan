@@ -36,6 +36,7 @@
          on_down/2,
          send_message/2,
          forward_message/3,
+         cast_message/3,
          receive_message/1,
          decode/1,
          reserve/1,
@@ -98,6 +99,10 @@ send_message(Name, Message) ->
 
 %% @doc Forward message to registered process on the remote side.
 forward_message(Name, ServerRef, Message) ->
+    gen_server:call(?MODULE, {forward_message, Name, ServerRef, Message}, infinity).
+
+%% @doc Cast message to registered process on the remote side.
+cast_message(Name, ServerRef, Message) ->
     gen_server:call(?MODULE, {forward_message, Name, ServerRef, Message}, infinity).
 
 %% @doc Receive message from a remote manager.

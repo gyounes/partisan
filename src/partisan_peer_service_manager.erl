@@ -38,6 +38,7 @@
 -callback send_message(name(), message()) -> ok.
 -callback receive_message(message()) -> ok.
 -callback forward_message(name(), pid(), message()) -> ok.
+-callback cast_message(name(), pid(), message()) -> ok.
 
 -callback on_down(name(), function()) -> ok | {error, not_implemented}.
 
