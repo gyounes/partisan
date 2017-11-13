@@ -23,7 +23,7 @@
 
 -behaviour(gen_server).
 
--export([start_link/4]).
+-export([start_link/2]).
 
 %% gen_server callbacks
 -export([init/1,
@@ -33,7 +33,7 @@
          terminate/2,
          code_change/3]).
 
--record(state, {socket, listen_addr, channel, from, peer}).
+-record(state, {socket, from, peer}).
 
 -type state_t() :: #state{}.
 
@@ -41,16 +41,15 @@
 -define(TIMEOUT, 1000).
 
 -include("partisan.hrl").
--include("partisan_peer_connection.hrl").
 
 %%%===================================================================
 %%% API
 %%%===================================================================
 
 %% @doc Start and link to calling process.
--spec start_link(node_spec(), listen_addr(), channel(), pid()) -> {ok, pid()} | ignore | {error, term()}.
-start_link(Peer, ListenAddr, Channel, From) ->
-    gen_server:start_link(?MODULE, [Peer, ListenAddr, Channel, From], []).
+-spec start_link(node_spec(), pid()) -> {ok, pid()} | ignore | {error, term()}.
+start_link(Peer, From) ->
+    gen_server:start_link(?MODULE, [Peer, From], []).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -58,19 +57,11 @@ start_link(Peer, ListenAddr, Channel, From) ->
 
 %% @private
 -spec init([iolist()]) -> {ok, state_t()}.
-init([Peer, ListenAddr, Channel, From]) ->
-    case connect(ListenAddr, Channel) of
+init([Peer, From]) ->
+    case connect(Peer) of
         {ok, Socket} ->
-            %% For debugging, store information in the process dictionary.
-            put({?MODULE, from}, From),
-            put({?MODULE, listen_addr}, ListenAddr),
-            put({?MODULE, channel}, Channel),
-            put({?MODULE, peer}, Peer),
-
-            {ok, #state{from=From, listen_addr=ListenAddr, channel=Channel, socket=Socket, peer=Peer}};
-        Error ->
-            lager:error("unable to connect to ~p due to ~p",
-                        [Peer, Error]),
+            {ok, #state{from=From, socket=Socket, peer=Peer}};
+        _Error ->
             {stop, normal}
     end.
 
@@ -80,7 +71,7 @@ init([Peer, ListenAddr, Channel, From]) ->
 
 %% @private
 handle_call({send_message, Message}, _From, #state{socket=Socket}=State) ->
-    case partisan_peer_connection:send(Socket, encode(Message)) of
+    case gen_tcp:send(Socket, encode(Message)) of
         ok ->
             {reply, ok, State};
         Error ->
@@ -94,7 +85,7 @@ handle_call(Msg, _From, State) ->
 -spec handle_cast(term(), state_t()) -> {noreply, state_t()}.
 %% @private
 handle_cast({send_message, Message}, #state{socket=Socket}=State) ->
-    case partisan_peer_connection:send(Socket, encode(Message)) of
+    case gen_tcp:send(Socket, encode(Message)) of
         ok ->
             ok;
         Error ->
@@ -107,10 +98,9 @@ handle_cast(Msg, State) ->
 
 %% @private
 -spec handle_info(term(), state_t()) -> {noreply, state_t()}.
-handle_info({Tag, _Socket, Data}, State0) when ?DATA_MSG(Tag) ->
+handle_info({tcp, _Socket, Data}, State0) ->
     handle_message(decode(Data), State0);
-handle_info({Tag, _Socket}, #state{peer = _Peer} = State) when ?CLOSED_MSG(Tag) ->
-    % lager:info("connection to ~p has been closed", [Peer]),
+handle_info({tcp_closed, _Socket}, State) ->
     {stop, normal, State};
 handle_info(Msg, State) ->
     lager:warning("Unhandled messages: ~p", [Msg]),
@@ -119,7 +109,7 @@ handle_info(Msg, State) ->
 %% @private
 -spec terminate(term(), state_t()) -> term().
 terminate(_Reason, #state{socket=Socket}) ->
-    ok = partisan_peer_connection:close(Socket),
+    ok = gen_tcp:close(Socket),
     ok.
 
 %% @private
@@ -138,30 +128,18 @@ code_change(_OldVsn, State, _Extra) ->
 %% every bind operation, but a different port instead of the standard
 %% port.
 %%
-connect(Node, Channel) when is_atom(Node) ->
-    ListenAddrs = rpc:call(Node, partisan_config, get, [listen_addrs]),
-    case length(ListenAddrs) > 0 of
-        true ->
-            ListenAddr = hd(ListenAddrs),
-            connect(ListenAddr, Channel);
-        _ ->
-            {error, no_listen_addr}
-    end;
+connect(Peer) when is_atom(Peer) ->
+    %% Bootstrap with disterl.
+    PeerPort = rpc:call(Peer,
+                        partisan_config,
+                        get,
+                        [peer_port, ?PEER_PORT]),
+    connect({Peer, {127, 0, 0, 1}, PeerPort});
 
 %% @doc Connect to remote peer.
-%%      Only use the first listen address.
-connect(#{ip := Address, port := Port}, Channel) ->
-    Monotonic = case Channel of
-        {monotonic, _} ->
-            true;
-        _ ->
-            false
-    end,
-
-    SocketOptions = [binary, {active, true}, {packet, 4}, {keepalive, true}],
-    PartisanOptions = [{monotonic, Monotonic}],
-
-    case partisan_peer_connection:connect(Address, Port, SocketOptions, ?TIMEOUT, PartisanOptions) of
+connect({_Name, Address, Port}) ->
+    Options = [binary, {active, true}, {packet, 4}, {keepalive, true}],
+    case gen_tcp:connect(Address, Port, Options, ?TIMEOUT) of
         {ok, Socket} ->
             {ok, Socket};
         {error, Error} ->
@@ -177,37 +155,15 @@ handle_message({state, Tag, LocalState},
                #state{peer=Peer, from=From}=State) ->
     case LocalState of
         {state, _Active, Epoch} ->
-            lager:info("got local state from peer ~p, informing ~p that we're connected",
-                       [Peer, From]),
             From ! {connected, Peer, Tag, Epoch, LocalState};
         _ ->
             From ! {connected, Peer, Tag, LocalState}
     end,
     {noreply, State};
-handle_message({hello, Node}, #state{peer=Peer, socket=Socket}=State) ->
-    % lager:info("sending hello to ~p", [Node]),
-
-    #{name := PeerName} = Peer,
-
-    case Node of
-        PeerName ->
-            Message = {hello, node()},
-
-            case partisan_peer_connection:send(Socket, encode(Message)) of
-                ok ->
-                    ok;
-                Error ->
-                    lager:info("failed to send hello message to node ~p due to ~p",
-                               [Node, Error])
-            end,
-
-            {noreply, State};
-        _ ->
-            %% If the peer isn't who it should be, abort.
-            lager:error("Peer ~p isn't ~p.", [Node, Peer]),
-            {stop, {unexpected_peer, Node, Peer}, State}
-    end;
-
+handle_message({hello, _Node}, #state{socket=Socket}=State) ->
+    Message = {hello, node()},
+    ok = gen_tcp:send(Socket, encode(Message)),
+    {noreply, State};
 handle_message(Message, State) ->
     lager:info("Invalid message: ~p", [Message]),
     {stop, normal, State}.

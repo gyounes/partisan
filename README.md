@@ -3,7 +3,7 @@ Partisan
 
 [![Build Status](https://travis-ci.org/lasp-lang/partisan.svg?branch=master)](https://travis-ci.org/lasp-lang/partisan)
 
-Partisan is a flexible, TCP-based membership system for Erlang/Elixir.
+Partisan is a prototype and primarily used in experiments.
 
 Partisan features:
 
@@ -21,4 +21,4 @@ Partisan has many available peer service managers:
 * Full membership with TCP-based failure detection: `plumtree_default_peer_service_manager.`
 * Client/server topology: `plumtree_client_server_peer_service_manager.`
 * HyParView, hybrid partial view membership protocol, with TCP-based failure detection: `plumtree_hyparview_peer_service_manager.`
-* Static topology: `plumtree_static_peer_service_manager`.
+

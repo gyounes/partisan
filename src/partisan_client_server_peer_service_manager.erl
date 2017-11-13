@@ -31,16 +31,11 @@
          myself/0,
          get_local_state/0,
          join/1,
-         sync_join/1,
          leave/0,
          leave/1,
          on_down/2,
-         update_members/1,
          send_message/2,
-         cast_message/3,
          forward_message/3,
-         cast_message/4,
-         forward_message/4,
          receive_message/1,
          decode/1,
          reserve/1,
@@ -58,15 +53,18 @@
 
 -include("partisan.hrl").
 
+-define(SET, state_orset).
+
 -type pending() :: [node_spec()].
--type membership() :: sets:set(node_spec()).
+-type membership() :: ?SET:orswot().
 -type tag() :: atom().
 
--record(state, {myself :: node_spec(),
+-record(state, {actor :: actor(),
+                myself :: node_spec(),
                 tag :: tag(),
                 pending :: pending(),
                 membership :: membership(),
-                connections :: partisan_peer_service_connections:t()}).
+                connections :: connections()}).
 
 -type state_t() :: #state{}.
 
@@ -91,34 +89,15 @@ myself() ->
 get_local_state() ->
     gen_server:call(?MODULE, get_local_state, infinity).
 
-%% @doc Register a trigger to fire when a connection drops.
 on_down(_Name, _Function) ->
-    {error, not_implemented}.
-
-%% @doc Update membership.
-update_members(_Nodes) ->
     {error, not_implemented}.
 
 %% @doc Send message to a remote manager.
 send_message(Name, Message) ->
     gen_server:call(?MODULE, {send_message, Name, Message}, infinity).
 
-%% @doc Cast a message to a remote gen_server.
-cast_message(Name, ServerRef, Message) ->
-    cast_message(Name, ?DEFAULT_CHANNEL, ServerRef, Message).
-
-%% @doc Cast a message to a remote gen_server.
-cast_message(Name, Channel, ServerRef, Message) ->
-    FullMessage = {'$gen_cast', Message},
-    forward_message(Name, Channel, ServerRef, FullMessage),
-    ok.
-
 %% @doc Forward message to registered process on the remote side.
 forward_message(Name, ServerRef, Message) ->
-    forward_message(Name, ?DEFAULT_CHANNEL, ServerRef, Message).
-
-%% @doc Forward message to registered process on the remote side.
-forward_message(Name, _Channel, ServerRef, Message) ->
     gen_server:call(?MODULE, {forward_message, Name, ServerRef, Message}, infinity).
 
 %% @doc Receive message from a remote manager.
@@ -128,10 +107,6 @@ receive_message(Message) ->
 %% @doc Attempt to join a remote node.
 join(Node) ->
     gen_server:call(?MODULE, {join, Node}, infinity).
-
-%% @doc Attempt to join a remote node.
-sync_join(_Node) ->
-    {error, not_implemented}.
 
 %% @doc Leave the cluster.
 leave() ->
@@ -143,7 +118,7 @@ leave(Node) ->
 
 %% @doc Decode state.
 decode(State) ->
-    sets:to_list(State).
+    sets:to_list(?SET:query(State)).
 
 %% @doc Reserve a slot for the particular tag.
 reserve(Tag) ->
@@ -176,14 +151,19 @@ init([]) ->
     %% Process connection exits.
     process_flag(trap_exit, true),
 
-    Membership = maybe_load_state_from_disk(),
-    Connections = partisan_peer_service_connections:new(),
+    %% Schedule periodic gossip.
+    schedule_gossip(),
+
+    Actor = gen_actor(),
+    Membership = maybe_load_state_from_disk(Actor),
+    Connections = dict:new(),
     Myself = myself(),
 
     %% Get tag, if set.
     Tag = partisan_config:get(tag, undefined),
 
-    {ok, #state{tag=Tag,
+    {ok, #state{actor=Actor,
+                tag=Tag,
                 myself=Myself,
                 pending=[],
                 membership=Membership,
@@ -197,17 +177,24 @@ handle_call({reserve, _Tag}, _From, State) ->
     {reply, {error, no_available_slots}, State};
 
 handle_call({leave, Node}, _From,
-            #state{membership=Membership0}=State) ->
+            #state{actor=Actor,
+                   tag=Tag,
+                   connections=Connections,
+                   membership=Membership0}=State) ->
     %% Node may exist in the membership on multiple ports, so we need to
     %% remove all.
-    Membership = lists:foldl(fun(#{name := Name} = N, L0) ->
+    Membership = lists:foldl(fun({N, _, _}, L0) ->
                         case Node of
-                            Name ->
-                                sets:del_element(N, Membership0);
+                            N ->
+                                {ok, L} = ?SET:mutate({rmv, Node}, Actor, L0),
+                                L;
                             _ ->
                                 L0
                         end
                 end, Membership0, decode(Membership0)),
+
+    %% Gossip.
+    do_gossip(Tag, Membership, Connections),
 
     %% Remove state and shutdown if we are removing ourselves.
     case node() of
@@ -220,7 +207,7 @@ handle_call({leave, Node}, _From,
             {reply, ok, State}
     end;
 
-handle_call({join, #{name := Name}=Node},
+handle_call({join, {Name, _, _}=Node},
             _From,
             #state{pending=Pending0, connections=Connections0}=State) ->
     %% Attempt to join via disterl for control messages during testing.
@@ -230,7 +217,7 @@ handle_call({join, #{name := Name}=Node},
     Pending = [Node|Pending0],
 
     %% Trigger connection.
-    Connections = partisan_util:maybe_connect(Node, Connections0),
+    Connections = maybe_connect(Node, Connections0),
 
     %% Return.
     {reply, ok, State#state{pending=Pending,
@@ -252,7 +239,7 @@ handle_call({receive_message, Message}, _From, State) ->
     handle_message(Message, State);
 
 handle_call(members, _From, #state{membership=Membership}=State) ->
-    Members = [P || #{name := P} <- members(Membership)],
+    Members = [P || {P, _, _} <- members(Membership)],
     {reply, {ok, Members}, State};
 
 handle_call(get_local_state, _From, #state{membership=Membership}=State) ->
@@ -268,12 +255,32 @@ handle_cast(Msg, State) ->
     lager:warning("Unhandled messages: ~p", [Msg]),
     {noreply, State}.
 
+%% @private
+-spec handle_info(term(), state_t()) -> {noreply, state_t()}.
+handle_info(gossip, #state{pending=Pending,
+                           tag=Tag,
+                           membership=Membership,
+                           connections=Connections0}=State) ->
+    Connections = establish_connections(Pending, Membership, Connections0),
+    do_gossip(Tag, Membership, Connections),
+    schedule_gossip(),
+    {noreply, State#state{connections=Connections}};
+
 handle_info({'EXIT', From, _Reason}, #state{connections=Connections0}=State) ->
-    {_, Connections} = partisan_peer_service_connections:prune(From, Connections0),
+    FoldFun = fun(K, V, AccIn) ->
+                      case V =:= From of
+                          true ->
+                              dict:store(K, undefined, AccIn);
+                          false ->
+                              AccIn
+                      end
+              end,
+    Connections = dict:fold(FoldFun, Connections0, Connections0),
     {noreply, State#state{connections=Connections}};
 
 handle_info({connected, Node, TheirTag, _RemoteState},
                #state{pending=Pending0,
+                      actor=Actor,
                       tag=OurTag,
                       membership=Membership0,
                       connections=Connections0}=State) ->
@@ -285,7 +292,7 @@ handle_info({connected, Node, TheirTag, _RemoteState},
                     Pending = Pending0 -- [Node],
 
                     %% Add to our membership.
-                    Membership = sets:add_element(Node, Membership0),
+                    Membership = add_to_membership(Actor, Node, Membership0),
 
                     %% Announce to the peer service.
                     partisan_peer_service_events:update(Membership),
@@ -295,8 +302,11 @@ handle_info({connected, Node, TheirTag, _RemoteState},
                                                         Membership,
                                                         Connections0),
 
+                    %% Gossip the new membership.
+                    do_gossip(OurTag, Membership, Connections),
+
                     %% Compute count.
-                    Count = sets:size(Membership),
+                    Count = sets:size(?SET:query(Membership)),
 
                     lager:info("Join ACCEPTED with ~p; node is ~p and we are ~p: we have ~p members in our view.",
                                [Node, TheirTag, OurTag, Count]),
@@ -323,19 +333,14 @@ handle_info(Msg, State) ->
 %% @private
 -spec terminate(term(), state_t()) -> term().
 terminate(_Reason, #state{connections=Connections}=_State) ->
-    Fun =
-        fun(_K, Pids) ->
-            lists:foreach(
-              fun({_ListenAddr, _Channel, Pid}) ->
-                 try
-                     gen_server:stop(Pid, normal, infinity)
-                 catch
-                     _:_ ->
-                         ok
-                 end
-              end, Pids)
-         end,
-    partisan_peer_service_connections:foreach(Fun, Connections),
+    dict:map(fun(_K, Pid) ->
+                     try
+                         gen_server:stop(Pid, normal, infinity)
+                     catch
+                         _:_ ->
+                             ok
+                     end
+             end, Connections),
     ok.
 
 %% @private
@@ -348,10 +353,21 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 
 %% @private
-empty_membership() ->
-    LocalState = sets:add_element(myself(), sets:new()),
+empty_membership(Actor) ->
+    Port = partisan_config:get(peer_port, ?PEER_PORT),
+    IPAddress = partisan_config:get(peer_ip, ?PEER_IP),
+    Self = {node(), IPAddress, Port},
+    {ok, LocalState} = ?SET:mutate({add, Self}, Actor, ?SET:new()),
     persist_state(LocalState),
     LocalState.
+
+%% @private
+gen_actor() ->
+    Node = atom_to_list(node()),
+    Unique = time_compat:unique_integer([positive]),
+    TS = integer_to_list(Unique),
+    Term = Node ++ TS,
+    crypto:hash(sha, Term).
 
 %% @private
 data_root() ->
@@ -370,7 +386,7 @@ write_state_to_disk(State) ->
         Dir ->
             File = filename:join(Dir, "cluster_state"),
             ok = filelib:ensure_dir(File),
-            ok = file:write_file(File, term_to_binary(State))
+            ok = file:write_file(File, ?SET:encode(erlang, State))
     end.
 
 %% @private
@@ -390,18 +406,17 @@ delete_state_from_disk() ->
     end.
 
 %% @private
-maybe_load_state_from_disk() ->
+maybe_load_state_from_disk(Actor) ->
     case data_root() of
         undefined ->
-            empty_membership();
+            empty_membership(Actor);
         Dir ->
             case filelib:is_regular(filename:join(Dir, "cluster_state")) of
                 true ->
                     {ok, Bin} = file:read_file(filename:join(Dir, "cluster_state")),
-                    {ok, State} = binary_to_term(Bin),
-                    State;
+                    ?SET:decode(erlang, Bin);
                 false ->
-                    empty_membership()
+                    empty_membership(Actor)
             end
     end.
 
@@ -411,44 +426,157 @@ persist_state(State) ->
 
 %% @private
 members(Membership) ->
-    sets:to_list(Membership).
+    sets:to_list(?SET:query(Membership)).
 
 %% @private
 establish_connections(Pending, Membership, Connections) ->
     %% Reconnect disconnected members and members waiting to join.
     Members = members(Membership),
-    AllPeers = lists:filter(fun(#{name := Name}) ->
-                         case node() of
-                             Name ->
-                                 false;
-                             _ ->
-                                 true
-                         end
-                 end, Members ++ Pending),
-    lists:foldl(fun partisan_util:maybe_connect/2, Connections, AllPeers).
+    AllPeers = lists:keydelete(node(), 1, Members ++ Pending),
+    lists:foldl(fun maybe_connect/2, Connections, AllPeers).
 
+%% @private
+%%
+%% Function should enforce the invariant that all cluster members are
+%% keys in the dict pointing to undefined if they are disconnected or a
+%% socket pid if they are connected.
+%%
+maybe_connect({Name, _, _} = Node, Connections0) ->
+    Connections = case dict:find(Name, Connections0) of
+        %% Found in dict, and disconnected.
+        {ok, undefined} ->
+            case connect(Node) of
+                {ok, Pid} ->
+                    dict:store(Name, Pid, Connections0);
+                _ ->
+                    dict:store(Name, undefined, Connections0)
+            end;
+        %% Found in dict and connected.
+        {ok, _Pid} ->
+            Connections0;
+        %% Not present; disconnected.
+        error ->
+            case connect(Node) of
+                {ok, Pid} ->
+                    dict:store(Name, Pid, Connections0);
+                _ ->
+                    dict:store(Name, undefined, Connections0)
+            end
+    end,
+    Connections.
+
+%% @private
+connect(Node) ->
+    Self = self(),
+    partisan_peer_service_client:start_link(Node, Self).
+
+%% @private
+handle_message({receive_state, TheirTag, PeerMembership},
+               #state{pending=Pending,
+                      tag=OurTag,
+                      membership=Membership,
+                      connections=Connections0}=State) ->
+    %% Only exchange with nodes that have the same tag: clients to
+    %% clients and servers to servers.
+    %%
+    case TheirTag =:= OurTag of
+        true ->
+            case ?SET:equal(PeerMembership, Membership) of
+                true ->
+                    %% No change.
+                    {reply, ok, State};
+                false ->
+                    %% Merge data items.
+                    Merged = ?SET:merge(PeerMembership, Membership),
+
+                    %% Persist state.
+                    persist_state(Merged),
+
+                    %% Update users of the peer service.
+                    partisan_peer_service_events:update(Merged),
+
+                    %% Compute members.
+                    Members = [N || {N, _, _} <- members(Merged)],
+
+                    %% Shutdown if we've been removed from the cluster.
+                    case lists:member(node(), Members) of
+                        true ->
+                            %% Establish any new connections.
+                            Connections = establish_connections(Pending,
+                                                                Membership,
+                                                                Connections0),
+
+                            %% Gossip.
+                            do_gossip(OurTag, Membership, Connections),
+
+                            {reply, ok, State#state{membership=Merged,
+                                                    connections=Connections}};
+                        false ->
+                            %% Remove state.
+                            delete_state_from_disk(),
+
+                            %% Shutdown; connections terminated on shutdown.
+                            {stop, normal, State#state{membership=Membership}}
+                    end
+            end;
+        false ->
+            {reply, ok, State}
+    end;
 handle_message({forward_message, ServerRef, Message}, State) ->
-    ServerRef ! Message,
+    gen_server:cast(ServerRef, Message),
     {reply, ok, State}.
 
 %% @private
--spec do_send_message(Node :: atom() | node_spec(),
-                      Message :: term(),
-                      Connections :: partisan_peer_service_connections:t()) ->
-            {error, disconnected} | {error, not_yet_connected} | {error, term()} | ok.
-do_send_message(Node, Message, Connections) ->
+schedule_gossip() ->
+    GossipInterval = partisan_config:get(gossip_interval, 10000),
+    erlang:send_after(GossipInterval, ?MODULE, gossip).
+
+%% @private
+do_gossip(Tag, Membership, Connections) ->
+    Fanout = partisan_config:get(fanout, ?FANOUT),
+
+    case get_peers(Membership) of
+        [] ->
+            ok;
+        AllPeers ->
+            {ok, Peers} = random_peers(AllPeers, Fanout),
+            lists:foreach(fun(Peer) ->
+                        do_send_message(Peer,
+                                        {receive_state, Tag, Membership},
+                                        Connections)
+                end, Peers),
+            ok
+    end.
+
+%% @private
+get_peers(Local) ->
+    Members = members(Local),
+    Peers = [X || {X, _, _} <- Members, X /= node()],
+    Peers.
+
+%% @private
+random_peers(Peers, Fanout) ->
+    Shuffled = shuffle(Peers),
+    Peer = lists:sublist(Shuffled, Fanout),
+    {ok, Peer}.
+
+%% @private
+do_send_message(Name, Message, Connections) ->
     %% Find a connection for the remote node, if we have one.
-    case partisan_peer_service_connections:find(Node, Connections) of
-        {ok, []} ->
+    case dict:find(Name, Connections) of
+        {ok, undefined} ->
             %% Node was connected but is now disconnected.
             {error, disconnected};
-        {ok, Entries} ->
-            Pid = partisan_util:dispatch_pid(Entries),
+        {ok, Pid} ->
             gen_server:cast(Pid, {send_message, Message});
-        {error, not_found} ->
+        error ->
             %% Node has not been connected yet.
             {error, not_yet_connected}
     end.
+
+%% @reference http://stackoverflow.com/questions/8817171/shuffling-elements-in-a-list-randomly-re-arrange-list-elements/8820501#8820501
+shuffle(L) ->
+    [X || {_, X} <- lists:sort([{rand_compat:uniform(), N} || N <- L])].
 
 %% @private
 accept_join_with_tag(OurTag, TheirTag) ->
@@ -475,3 +603,8 @@ accept_join_with_tag(OurTag, TheirTag) ->
                     false
             end
     end.
+
+%% @private
+add_to_membership(Actor, Node, Membership0) ->
+    {ok, Membership} = ?SET:mutate({add, Node}, Actor, Membership0),
+    Membership.

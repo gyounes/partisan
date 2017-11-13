@@ -30,16 +30,11 @@
          myself/0,
          get_local_state/0,
          join/1,
-         sync_join/1,
          leave/0,
          leave/1,
-         update_members/1,
          on_down/2,
          send_message/2,
-         cast_message/3,
          forward_message/3,
-         cast_message/4,
-         forward_message/4,
          receive_message/1,
          decode/1,
          reserve/1,
@@ -63,7 +58,7 @@
 -record(state, {myself :: node_spec(),
                 pending :: pending(),
                 membership :: membership(),
-                connections :: partisan_peer_service_connections:t()}).
+                connections :: connections()}).
 
 -type state_t() :: #state{}.
 
@@ -88,35 +83,16 @@ myself() ->
 get_local_state() ->
     gen_server:call(?MODULE, get_local_state, infinity).
 
-%% @doc Trigger function on connection close for a given node.
 on_down(_Name, _Function) ->
-    {error, not_implemented}.
-
-%% @doc Update membership.
-update_members(_Nodes) ->
     {error, not_implemented}.
 
 %% @doc Send message to a remote manager.
 send_message(Name, Message) ->
     gen_server:call(?MODULE, {send_message, Name, Message}, infinity).
 
-%% @doc Cast a message to a remote gen_server.
-cast_message(Name, ServerRef, Message) ->
-    cast_message(Name, ?DEFAULT_CHANNEL, ServerRef, Message).
-
-%% @doc Cast a message to a remote gen_server.
-cast_message(Name, Channel, ServerRef, Message) ->
-    FullMessage = {'$gen_cast', Message},
-    forward_message(Name, Channel, ServerRef, FullMessage),
-    ok.
-
 %% @doc Forward message to registered process on the remote side.
 forward_message(Name, ServerRef, Message) ->
-    forward_message(Name, ?DEFAULT_CHANNEL, ServerRef, Message).
-
-%% @doc Forward message to registered process on the remote side.
-forward_message(Name, Channel, ServerRef, Message) ->
-    gen_server:call(?MODULE, {forward_message, Name, Channel, ServerRef, Message}, infinity).
+    gen_server:call(?MODULE, {forward_message, Name, ServerRef, Message}, infinity).
 
 %% @doc Receive message from a remote manager.
 receive_message(Message) ->
@@ -125,10 +101,6 @@ receive_message(Message) ->
 %% @doc Attempt to join a remote node.
 join(Node) ->
     gen_server:call(?MODULE, {join, Node}, infinity).
-
-%% @doc Attempt to join a remote node.
-sync_join(_Node) ->
-    {error, not_implemented}.
 
 %% @doc Leave the cluster.
 leave() ->
@@ -174,7 +146,7 @@ init([]) ->
     process_flag(trap_exit, true),
 
     Membership = maybe_load_state_from_disk(),
-    Connections = partisan_peer_service_connections:new(),
+    Connections = dict:new(),
     Myself = myself(),
 
     {ok, #state{myself=Myself,
@@ -192,7 +164,7 @@ handle_call({reserve, _Tag}, _From, State) ->
 handle_call({leave, _Node}, _From, State) ->
     {reply, error, State};
 
-handle_call({join, #{name := Name}=Node},
+handle_call({join, {Name, _, _}=Node},
             _From,
             #state{pending=Pending0, connections=Connections0}=State) ->
     %% Attempt to join via disterl for control messages during testing.
@@ -202,7 +174,7 @@ handle_call({join, #{name := Name}=Node},
     Pending = [Node|Pending0],
 
     %% Trigger connection.
-    Connections = partisan_util:maybe_connect(Node, Connections0),
+    Connections = maybe_connect(Node, Connections0),
 
     %% Return.
     {reply, ok, State#state{pending=Pending,
@@ -213,7 +185,7 @@ handle_call({send_message, Name, Message}, _From,
     Result = do_send_message(Name, Message, Connections),
     {reply, Result, State};
 
-handle_call({forward_message, Name, _Channel, ServerRef, Message}, _From,
+handle_call({forward_message, Name, ServerRef, Message}, _From,
             #state{connections=Connections}=State) ->
     Result = do_send_message(Name,
                              {forward_message, ServerRef, Message},
@@ -224,7 +196,7 @@ handle_call({receive_message, Message}, _From, State) ->
     handle_message(Message, State);
 
 handle_call(members, _From, #state{membership=Membership}=State) ->
-    Members = [P || #{name := P} <- members(Membership)],
+    Members = [P || {P, _, _} <- members(Membership)],
     {reply, {ok, Members}, State};
 
 handle_call(get_local_state, _From, #state{membership=Membership}=State) ->
@@ -241,7 +213,15 @@ handle_cast(Msg, State) ->
     {noreply, State}.
 
 handle_info({'EXIT', From, _Reason}, #state{connections=Connections0}=State) ->
-    {_, Connections} = partisan_peer_service_connections:prune(From, Connections0),
+    FoldFun = fun(K, V, AccIn) ->
+                      case V =:= From of
+                          true ->
+                              dict:store(K, undefined, AccIn);
+                          false ->
+                              AccIn
+                      end
+              end,
+    Connections = dict:fold(FoldFun, Connections0, Connections0),
     {noreply, State#state{connections=Connections}};
 
 handle_info({connected, Node, _Tag, _RemoteState},
@@ -285,19 +265,14 @@ handle_info(Msg, State) ->
 %% @private
 -spec terminate(term(), state_t()) -> term().
 terminate(_Reason, #state{connections=Connections}=_State) ->
-    Fun =
-        fun(_K, Pids) ->
-            lists:foreach(
-              fun({_ListenAddr, _Channel, Pid}) ->
-                 try
-                     gen_server:stop(Pid, normal, infinity)
-                 catch
-                     _:_ ->
-                         ok
-                 end
-              end, Pids)
-         end,
-    partisan_peer_service_connections:foreach(Fun, Connections),
+    dict:map(fun(_K, Pid) ->
+                     try
+                         gen_server:stop(Pid, normal, infinity)
+                     catch
+                         _:_ ->
+                             ok
+                     end
+             end, Connections),
     ok.
 
 %% @private
@@ -363,35 +338,58 @@ members(Membership) ->
 establish_connections(Pending, Membership, Connections) ->
     %% Reconnect disconnected members and members waiting to join.
     Members = members(Membership),
-    AllPeers = lists:filter(fun(#{name := N}) ->
-                      case node() of
-                          N ->
-                              false;
-                          _ ->
-                              true
-                      end
-              end, Members ++ Pending),
-    lists:foldl(fun partisan_util:maybe_connect/2, Connections, AllPeers).
+    AllPeers = lists:keydelete(node(), 1, Members ++ Pending),
+    lists:foldl(fun maybe_connect/2, Connections, AllPeers).
+
+%% @private
+%%
+%% Function should enforce the invariant that all cluster members are
+%% keys in the dict pointing to undefined if they are disconnected or a
+%% socket pid if they are connected.
+%%
+maybe_connect({Name, _, _} = Node, Connections0) ->
+    Connections = case dict:find(Name, Connections0) of
+        %% Found in dict, and disconnected.
+        {ok, undefined} ->
+            case connect(Node) of
+                {ok, Pid} ->
+                    dict:store(Name, Pid, Connections0);
+                _ ->
+                    dict:store(Name, undefined, Connections0)
+            end;
+        %% Found in dict and connected.
+        {ok, _Pid} ->
+            Connections0;
+        %% Not present; disconnected.
+        error ->
+            case connect(Node) of
+                {ok, Pid} ->
+                    dict:store(Name, Pid, Connections0);
+                _ ->
+                    dict:store(Name, undefined, Connections0)
+            end
+    end,
+    Connections.
+
+%% @private
+connect(Node) ->
+    Self = self(),
+    partisan_peer_service_client:start_link(Node, Self).
 
 handle_message({forward_message, ServerRef, Message}, State) ->
-    ServerRef ! Message,
+    gen_server:cast(ServerRef, Message),
     {reply, ok, State}.
 
 %% @private
--spec do_send_message(Node :: node_spec(),
-                      Message :: term(),
-                      Connections :: partisan_peer_service_connections:t()) ->
-            {error, disconnected} | {error, not_yet_connected} | {error, term()} | ok.
-do_send_message(Node, Message, Connections) ->
+do_send_message(Name, Message, Connections) ->
     %% Find a connection for the remote node, if we have one.
-    case partisan_peer_service_connections:find(Node, Connections) of
-        {ok, []} ->
+    case dict:find(Name, Connections) of
+        {ok, undefined} ->
             %% Node was connected but is now disconnected.
             {error, disconnected};
-        {ok, Entries} ->
-            Pid = partisan_util:dispatch_pid(Entries),
+        {ok, Pid} ->
             gen_server:cast(Pid, {send_message, Message});
-        {error, not_found} ->
+        error ->
             %% Node has not been connected yet.
             {error, not_yet_connected}
     end.

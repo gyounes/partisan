@@ -25,21 +25,13 @@
          join/2,
          join/3,
          attempt_join/1,
-         sync_join/1,
-         sync_join/2,
-         sync_join/3,
-         attempt_sync_join/1,
          leave/1,
          decode/1,
-         update_members/1,
          stop/0,
          stop/1,
          members/0,
-         connections/0,
          manager/0,
-         add_sup_callback/1,
-         cast_message/3,
-         forward_message/3]).
+         add_sup_callback/1]).
 
 -include("partisan.hrl").
 
@@ -52,25 +44,13 @@ manager() ->
 join(Node) ->
     join(Node, true).
 
-%% @doc prepare node to join a cluster
-sync_join(Node) ->
-    sync_join(Node, true).
-
 %% @doc Convert nodename to atom
 join(NodeStr, Auto) when is_list(NodeStr) ->
     join(erlang:list_to_atom(lists:flatten(NodeStr)), Auto);
 join(Node, Auto) when is_atom(Node) ->
     join(node(), Node, Auto);
-join(Node, _Auto) ->
+join({_Name, _IPAddress, _Port} = Node, _Auto) ->
     attempt_join(Node).
-
-%% @doc Convert nodename to atom
-sync_join(NodeStr, Auto) when is_list(NodeStr) ->
-    sync_join(erlang:list_to_atom(lists:flatten(NodeStr)), Auto);
-sync_join(Node, Auto) when is_atom(Node) ->
-    sync_join(node(), Node, Auto);
-sync_join(Node, _Auto) ->
-    attempt_sync_join(Node).
 
 %% @doc Initiate join. Nodes cannot join themselves.
 join(Node, Node, _) ->
@@ -78,66 +58,29 @@ join(Node, Node, _) ->
 join(_, Node, _Auto) ->
     attempt_join(Node).
 
-%% @doc Initiate join. Nodes cannot join themselves.
-sync_join(Node, Node, _) ->
-    {error, self_join};
-sync_join(_, Node, _Auto) ->
-    attempt_sync_join(Node).
-
-%% @doc Return node members.
+%% @doc Return cluster members.
 members() ->
     Manager = manager(),
     Manager:members().
-
-%% @doc Return node connections.
-connections() ->
-    Manager = manager(),
-    Manager:connections().
-
-%% @doc Update cluster members.
-update_members(Nodes) ->
-    Manager = manager(),
-    Manager:update_members(Nodes).
 
 %% @doc Add callback.
 add_sup_callback(Function) ->
     partisan_peer_service_events:add_sup_callback(Function).
 
-%% @doc Cast message to registered process on the remote side.
-cast_message(Name, ServerRef, Message) ->
-    Manager = manager(),
-    Manager:cast_message(Name, ServerRef, Message).
-
-%% @doc Forward message to registered process on the remote side.
-forward_message(Name, ServerRef, Message) ->
-    Manager = manager(),
-    Manager:forward_message(Name, ServerRef, Message).
-
 %% @private
 decode(State) ->
     Manager = manager(),
-    [P || #{name := P} <- Manager:decode(State)].
+    [P || {P, _, _} <- Manager:decode(State)].
 
 %% @private
-attempt_join(Node) when is_atom(Node) ->
-    ListenAddrs = rpc:call(Node, partisan_config, get, [listen_addrs]),
-    attempt_join(#{name => Node, listen_addrs => ListenAddrs});
-attempt_join(#{name := _Name} = Node) ->
+attempt_join({_Name, _, _}=Node) ->
     Manager = manager(),
     Manager:join(Node).
 
-%% @private
-attempt_sync_join(Node) when is_atom(Node) ->
-    ListenAddrs = rpc:call(Node, partisan_config, get, [listen_addrs]),
-    attempt_sync_join(#{name => Node, listen_addrs => ListenAddrs});
-attempt_sync_join(#{name := _Name} = Node) ->
-    Manager = manager(),
-    Manager:sync_join(Node).
-
 %% @doc Attempt to leave the cluster.
-leave(Node) ->
+leave(_Args) when is_list(_Args) ->
     Manager = manager(),
-    Manager:leave(Node).
+    Manager:leave().
 
 %% @doc Stop.
 stop() ->

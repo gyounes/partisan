@@ -27,10 +27,7 @@ packageclean:
 ## Test targets
 ##
 
-kill: 
-	pkill -9 beam.smp; pkill -9 epmd; exit 0
-
-check: kill test xref dialyzer
+check: test xref dialyzer lint
 
 test: ct eunit
 
@@ -41,9 +38,7 @@ eunit:
 	${REBAR} as test eunit
 
 ct:
-	openssl rand -out test/partisan_SUITE_data/RAND 4096
-	${REBAR} ct
-	${REBAR} cover
+	${REBAR} as test ct
 
 shell:
 	${REBAR} shell --apps partisan

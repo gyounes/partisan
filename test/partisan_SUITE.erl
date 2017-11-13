@@ -22,17 +22,13 @@
 -module(partisan_SUITE).
 -author("Christopher Meiklejohn <christopher.meiklejohn@gmail.com>").
 
--include("partisan.hrl").
-
 %% common_test callbacks
 -export([%% suite/0,
          init_per_suite/1,
          end_per_suite/1,
          init_per_testcase/2,
          end_per_testcase/2,
-         all/0,
-         groups/0,
-         init_per_group/2]).
+         all/0]).
 
 %% tests
 -compile([export_all]).
@@ -41,7 +37,9 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("kernel/include/inet.hrl").
 
+-define(APP, partisan).
 -define(CLIENT_NUMBER, 3).
+-define(PEER_PORT, 9000).
 
 %% ===================================================================
 %% common_test callbacks
@@ -53,89 +51,24 @@ init_per_suite(_Config) ->
 end_per_suite(_Config) ->
     _Config.
 
-init_per_testcase(Case, Config) ->
+init_per_testcase(Case, _Config) ->
     ct:pal("Beginning test case ~p", [Case]),
 
-    [{hash, erlang:phash2({Case, Config})}|Config].
+    _Config.
 
 end_per_testcase(Case, _Config) ->
     ct:pal("Ending test case ~p", [Case]),
 
     _Config.
 
-init_per_group(with_sync_join, Config) ->
-    [{parallelism, 1}, {sync_join, true}] ++ Config;
-init_per_group(with_monotonic_channels, Config) ->
-    [{parallelism, 1}, {channels, [{monotonic, vnode}, gossip]}] ++ Config;
-init_per_group(with_channels, Config) ->
-    [{parallelism, 1}, {channels, [vnode, gossip]}] ++ Config;
-init_per_group(with_parallelism, Config) ->
-    [{parallelism, 5}, {channels, ?CHANNELS}] ++ Config;
-init_per_group(with_no_channels, Config) ->
-    [{parallelism, 1}, {channels, []}] ++ Config;
-init_per_group(with_tls, Config) ->
-    TLSOpts = make_certs(Config),
-    [{parallelism, 1}, {tls, true}] ++ TLSOpts ++ Config;
-init_per_group(_, Config) ->
-    [{parallelism, 1}] ++ Config.
-
-end_per_group(_, _Config) ->
-    ok.
-
 all() ->
     [
-     {group, default, [parallel],
-      [{simple, [shuffle]},
-       {hyparview, [shuffle]}
-      ]},
-
-     {group, with_tls, [parallel]},
-
-     {group, with_parallelism, [parallel]},
-
-     {group, with_channels, [parallel]},
-
-     {group, with_no_channels, [parallel]},
-     
-     {group, with_monotonic_channels, [parallel]},
-
-     {group, with_sync_join, [parallel]}
-    ].
-
-groups() ->
-    [
-     {default, [],
-      [{group, simple},
-       {group, hyparview}
-      ]},
-
-     {simple, [],
-      [default_manager_test,
-       client_server_manager_test]},
-
-     {hyparview, [],
-      [%% hyparview_manager_partition_test,
-       hyparview_manager_high_active_test,
-       hyparview_manager_low_active_test,
-       hyparview_manager_high_client_test]},
-
-     {with_tls, [],
-      [default_manager_test]},
-
-     {with_parallelism, [],
-      [default_manager_test]},
-     
-     {with_channels, [],
-      [default_manager_test]},
-
-     {with_no_channels, [],
-      [default_manager_test]},
-
-     {with_monotonic_channels, [],
-      [default_manager_test]},
-
-     {with_sync_join, [],
-      [default_manager_test]}
+     default_manager_test,
+     client_server_manager_test,
+     hyparview_manager_partition_test,
+     hyparview_manager_high_active_test,
+     hyparview_manager_low_active_test,
+     hyparview_manager_high_client_test
     ].
 
 %% ===================================================================
@@ -147,10 +80,10 @@ default_manager_test(Config) ->
     Manager = partisan_default_peer_service_manager,
 
     %% Specify servers.
-    Servers = node_list(1, "server", Config),
+    Servers = [server],
 
     %% Specify clients.
-    Clients = node_list(?CLIENT_NUMBER, "client", Config),
+    Clients = client_list(?CLIENT_NUMBER),
 
     %% Start nodes.
     Nodes = start(default_manager_test, Config,
@@ -171,97 +104,14 @@ default_manager_test(Config) ->
             SortedMembers = lists:usort(Members),
             case SortedMembers =:= SortedNodes of
                 true ->
-                    true;
+                    ok;
                 false ->
-                    ct:pal("Membership incorrect; node ~p should have ~p but has ~p",
-                           [Node, SortedNodes, SortedMembers]),
-                    {false, {Node, SortedNodes, SortedMembers}}
+                    ct:fail("Membership incorrect; node ~p should have ~p but has ~p", [Node, Nodes, Members])
             end
     end,
 
     %% Verify the membership is correct.
-    lists:foreach(fun(Node) ->
-                          VerifyNodeFun = fun() -> VerifyFun(Node) end,
-
-                          case wait_until(VerifyNodeFun, 60 * 2, 100) of
-                              ok ->
-                                  ok;
-                              {fail, {false, {Node, Expected, Contains}}} ->
-                                 ct:fail("Membership incorrect; node ~p should have ~p but has ~p",
-                                         [Node, Expected, Contains])
-                          end
-                  end, Nodes),
-
-    %% Verify forward message functionality.
-    lists:foreach(fun({_Name, Node}) ->
-                    ok = check_forward_message(Node, Manager)
-                  end, Nodes),
-
-    %% Verify parallelism.
-    ConfigParallelism = proplists:get_value(parallelism, Config, ?PARALLELISM),
-    ct:pal("Configured parallelism: ~p", [ConfigParallelism]),
-
-    %% Verify channels.
-    ConfigChannels = proplists:get_value(channels, Config, ?CHANNELS),
-    ct:pal("Configured channels: ~p", [ConfigChannels]),
-
-    ConnectionsFun = fun(Node) ->
-                             Connections = rpc:call(Node,
-                                      partisan_default_peer_service_manager,
-                                      connections,
-                                      []),
-                             ct:pal("Connections: ~p~n", [Connections]),
-                             Connections
-                     end,
-
-    VerifyConnectionsFun = fun(Node, Channel, Parallelism) ->
-                                %% Get list of connections.
-                                {ok, Connections} = ConnectionsFun(Node),
-
-                                %% Verify we have enough connections.
-                                dict:fold(fun(_N, Active, Acc) ->
-                                    Filtered = lists:filter(fun({_, C, _}) -> 
-                                        case C of
-                                            Channel ->
-                                                true;
-                                            _ ->
-                                                false
-                                        end
-                                    end, Active),
-
-                                    case length(Filtered) == Parallelism of
-                                        true ->
-                                            Acc andalso true;
-                                        false ->
-                                            Acc andalso false
-                                    end
-                                end, true, Connections)
-                          end,
-
-    lists:foreach(fun({_Name, Node}) ->
-                        %% Get enabled parallelism.
-                        Parallelism = rpc:call(Node, partisan_config, get, [parallelism, ?PARALLELISM]),
-                        ct:pal("Parallelism is: ~p", [Parallelism]),
-
-                        %% Get enabled channels.
-                        Channels = rpc:call(Node, partisan_config, get, [channels, ?CHANNELS]),
-                        ct:pal("Channels are: ~p", [Channels]),
-
-                        lists:foreach(fun(Channel) ->
-                            %% Generate fun.
-                            VerifyConnectionsNodeFun = fun() ->
-                                                            VerifyConnectionsFun(Node, Channel, Parallelism)
-                                                    end,
-
-                            %% Wait until connections established.
-                            case wait_until(VerifyConnectionsNodeFun, 60 * 2, 100) of
-                                ok ->
-                                    ok;
-                                _ ->
-                                    ct:fail("Not enough connections have been opened; need: ~p", [Parallelism])
-                            end
-                        end, Channels)
-                  end, Nodes),
+    lists:foreach(VerifyFun, Nodes),
 
     %% Stop nodes.
     stop(Nodes),
@@ -273,10 +123,10 @@ client_server_manager_test(Config) ->
     Manager = partisan_client_server_peer_service_manager,
 
     %% Specify servers.
-    Servers = node_list(2, "server", Config), %% [server_1, server_2],
+    Servers = [server_1, server_2],
 
     %% Specify clients.
-    Clients = node_list(?CLIENT_NUMBER, "client", Config), %% client_list(?CLIENT_NUMBER),
+    Clients = client_list(?CLIENT_NUMBER),
 
     %% Start nodes.
     Nodes = start(client_server_manager_test, Config,
@@ -319,10 +169,7 @@ client_server_manager_test(Config) ->
     %% Verify the membership is correct.
     lists:foreach(VerifyFun, Nodes),
 
-    %% Verify forward message functionality.
-    lists:foreach(fun({_Name, Node}) ->
-                    ok = check_forward_message(Node, Manager)
-                  end, Nodes),
+    ct:pal("Nodes: ~p", [Nodes]),
 
     %% Stop nodes.
     stop(Nodes),
@@ -334,10 +181,10 @@ hyparview_manager_partition_test(Config) ->
     Manager = partisan_hyparview_peer_service_manager,
 
     %% Specify servers.
-    Servers = node_list(1, "server", Config), %% [server],
+    Servers = [server],
 
     %% Specify clients.
-    Clients = node_list(?CLIENT_NUMBER, "client", Config), %% client_list(?CLIENT_NUMBER),
+    Clients = client_list(?CLIENT_NUMBER),
 
     %% Start nodes.
     Nodes = start(hyparview_manager_partition_test, Config,
@@ -346,34 +193,60 @@ hyparview_manager_partition_test(Config) ->
                    {servers, Servers},
                    {clients, Clients}]),
 
-    CheckStartedFun = fun() ->
-                        case hyparview_membership_check(Nodes) of
-                            {[], []} -> true;
-                            {ConnectedFails, []} ->
-                                {connected_check_failed, ConnectedFails};
-                            {[], SymmetryFails} ->
-                                {symmetry_check_failed, SymmetryFails};
-                            {ConnectedFails, SymmetryFails} ->
-                                [{connected_check_failed, ConnectedFails},
-                                 {symmetry_check_failed, SymmetryFails}]
-                        end
-                      end,
+    %% Pause for clustering.
+    timer:sleep(1000),
 
-    case wait_until(CheckStartedFun, 60 * 2, 100) of
-        ok ->
-            ok;
-        {fail, {false, {connected_check_failed, Nodes}}} ->
-            ct:fail("Graph is not connected, unable to find route between pairs of nodes ~p",
-                    [Nodes]);
-        {fail, {false, {symmetry_check_failed, Nodes}}} ->
-            ct:fail("Symmetry is broken (ie. node1 has node2 in it's view but vice-versa is not true) between the following "
-                    "pairs of nodes: ~p", [Nodes]);
-        {fail, {false, [{connected_check_failed, ConnectedFails},
-                        {symmetry_check_failed, SymmetryFails}]}} ->
-            ct:fail("Graph is not connected, unable to find route between pairs of nodes ~p, symmetry is broken as well"
-                    "(ie. node1 has node2 in it's view but vice-versa is not true) between the following "
-                    "pairs of nodes: ~p", [ConnectedFails, SymmetryFails])
-    end,
+    %% Create new digraph.
+    Graph = digraph:new(),
+
+    %% Verify connectedness.
+    %%
+    ConnectFun = fun({_, Node}) ->
+        {ok, ActiveSet} = rpc:call(Node, Manager, active, []),
+        Active = sets:to_list(ActiveSet),
+
+        %% Add vertexes and edges.
+        [connect(Graph, Node, N) || {N, _, _} <- Active]
+                 end,
+
+    %% Build the graph.
+    lists:foreach(ConnectFun, Nodes),
+
+    %% Verify connectedness.
+    ConnectedFun = fun({_Name, Node}=Myself) ->
+        lists:foreach(fun({_, N}) ->
+            Path = digraph:get_short_path(Graph, Node, N),
+            case Path of
+                false ->
+                    ct:fail("Graph is not connected!");
+                _ ->
+                    ok
+            end
+                      end, Nodes -- [Myself])
+                   end,
+    lists:foreach(ConnectedFun, Nodes),
+
+    %% Verify symmetry.
+    SymmetryFun = fun({_, Node1}) ->
+        %% Get first nodes active set.
+        {ok, ActiveSet1} = rpc:call(Node1, Manager, active, []),
+        Active1 = sets:to_list(ActiveSet1),
+
+        lists:foreach(fun({Node2, _, _}) ->
+            %% Get second nodes active set.
+            {ok, ActiveSet2} = rpc:call(Node2, Manager, active, []),
+            Active2 = sets:to_list(ActiveSet2),
+
+            case lists:member(Node1, [N || {N, _, _} <- Active2]) of
+                true ->
+                    ok;
+                false ->
+                    ct:fail("~p has ~p in it's view but ~p does not have ~p in its view",
+                            [Node1, Node2, Node2, Node1])
+            end
+                      end, Active1)
+                  end,
+    lists:foreach(SymmetryFun, Nodes),
 
     ct:pal("Nodes: ~p", [Nodes]),
 
@@ -405,7 +278,6 @@ hyparview_manager_partition_test(Config) ->
     ok = rpc:call(PNode, Manager, resolve_partition, [Reference]),
     ct:pal("Partition resolved: ~p", [Reference]),
 
-    %% Pause for clustering.
     timer:sleep(1000),
 
     %% Verify resolved partition.
@@ -421,29 +293,6 @@ hyparview_manager_partition_test(Config) ->
     end,
     lists:foreach(ResolveVerifyFun, Nodes),
 
-    %% Verify forward message functionality.
-    lists:foreach(fun({_Name, Node}) ->
-                    ok = check_forward_message(Node, Manager)
-                  end, Nodes),
-
-    %% Verify correct behaviour when a node is stopped
-    {_, KilledNode} = N0 = random(Nodes, []),
-    ok = rpc:call(KilledNode, partisan, stop, []),
-    CheckStoppedFun = fun() ->
-                        case hyparview_check_stopped_member(KilledNode, Nodes -- [N0]) of
-                            [] -> true;
-                            FailedNodes ->
-                                FailedNodes
-                        end
-                      end,
-    case wait_until(CheckStoppedFun, 60 * 2, 100) of
-        ok ->
-            ok;
-        {fail, FailedNodes} ->
-            ct:fail("~p has been killed, it should not be in membership of nodes ~p",
-                    [KilledNode, FailedNodes])
-    end,
-
     %% Stop nodes.
     stop(Nodes),
 
@@ -454,10 +303,10 @@ hyparview_manager_high_active_test(Config) ->
     Manager = partisan_hyparview_peer_service_manager,
 
     %% Specify servers.
-    Servers = node_list(1, "server", Config), %% [server],
+    Servers = [server],
 
     %% Specify clients.
-    Clients = node_list(?CLIENT_NUMBER, "client", Config), %% client_list(?CLIENT_NUMBER),
+    Clients = client_list(?CLIENT_NUMBER),
 
     %% Start nodes.
     Nodes = start(hyparview_manager_high_active_test, Config,
@@ -466,57 +315,60 @@ hyparview_manager_high_active_test(Config) ->
                    {servers, Servers},
                    {clients, Clients}]),
 
-    CheckStartedFun = fun() ->
-                        case hyparview_membership_check(Nodes) of
-                            {[], []} -> true;
-                            {ConnectedFails, []} ->
-                                {false, {connected_check_failed, ConnectedFails}};
-                            {[], SymmetryFails} ->
-                                {false, {symmetry_check_failed, SymmetryFails}};
-                            {ConnectedFails, SymmetryFails} ->
-                                {false, [{connected_check_failed, ConnectedFails},
-                                         {symmetry_check_failed, SymmetryFails}]}
-                        end
-                      end,
+    %% Pause for clustering.
+    timer:sleep(1000),
 
-    case wait_until(CheckStartedFun, 60 * 2, 100) of
-        ok ->
-            ok;
-        {fail, {false, {connected_check_failed, Nodes}}} ->
-            ct:fail("Graph is not connected, unable to find route between pairs of nodes ~p",
-                    [Nodes]);
-        {fail, {false, {symmetry_check_failed, Nodes}}} ->
-            ct:fail("Symmetry is broken (ie. node1 has node2 in it's view but vice-versa is not true) between the following "
-                    "pairs of nodes: ~p", [Nodes]);
-        {fail, {false, [{connected_check_failed, ConnectedFails},
-                        {symmetry_check_failed, SymmetryFails}]}} ->
-            ct:fail("Graph is not connected, unable to find route between pairs of nodes ~p, symmetry is broken as well"
-                    "(ie. node1 has node2 in it's view but vice-versa is not true) between the following "
-                    "pairs of nodes: ~p", [ConnectedFails, SymmetryFails])
-    end,
+    %% Create new digraph.
+    Graph = digraph:new(),
 
-    %% Verify forward message functionality.
-    lists:foreach(fun({_Name, Node}) ->
-                    ok = check_forward_message(Node, Manager)
-                  end, Nodes),
+    %% Verify connectedness.
+    %%
+    ConnectFun = fun({_, Node}) ->
+        {ok, ActiveSet} = rpc:call(Node, Manager, active, []),
+        Active = sets:to_list(ActiveSet),
 
-    %% Verify correct behaviour when a node is stopped
-    {_, KilledNode} = N0 = random(Nodes, []),
-    ok = rpc:call(KilledNode, partisan, stop, []),
-    CheckStoppedFun = fun() ->
-                        case hyparview_check_stopped_member(KilledNode, Nodes -- [N0]) of
-                            [] -> true;
-                            FailedNodes ->
-                                FailedNodes
-                        end
-                      end,
-    case wait_until(CheckStoppedFun, 60 * 2, 100) of
-        ok ->
-            ok;
-        {fail, FailedNodes} ->
-            ct:fail("~p has been killed, it should not be in membership of nodes ~p",
-                    [KilledNode, FailedNodes])
-    end,
+        %% Add vertexes and edges.
+        [connect(Graph, Node, N) || {N, _, _} <- Active]
+                 end,
+
+    %% Build the graph.
+    lists:foreach(ConnectFun, Nodes),
+
+    %% Verify connectedness.
+    ConnectedFun = fun({_Name, Node}=Myself) ->
+        lists:foreach(fun({_, N}) ->
+            Path = digraph:get_short_path(Graph, Node, N),
+            case Path of
+                false ->
+                    ct:fail("Graph is not connected!");
+                _ ->
+                    ok
+            end
+                      end, Nodes -- [Myself])
+                   end,
+    lists:foreach(ConnectedFun, Nodes),
+
+    %% Verify symmetry.
+    SymmetryFun = fun({_, Node1}) ->
+        %% Get first nodes active set.
+        {ok, ActiveSet1} = rpc:call(Node1, Manager, active, []),
+        Active1 = sets:to_list(ActiveSet1),
+
+        lists:foreach(fun({Node2, _, _}) ->
+            %% Get second nodes active set.
+            {ok, ActiveSet2} = rpc:call(Node2, Manager, active, []),
+            Active2 = sets:to_list(ActiveSet2),
+
+            case lists:member(Node1, [N || {N, _, _} <- Active2]) of
+                true ->
+                    ok;
+                false ->
+                    ct:fail("~p has ~p in it's view but ~p does not have ~p in its view",
+                            [Node1, Node2, Node2, Node1])
+            end
+                      end, Active1)
+                  end,
+    lists:foreach(SymmetryFun, Nodes),
 
     %% Stop nodes.
     stop(Nodes),
@@ -530,9 +382,9 @@ hyparview_manager_low_active_test(Config) ->
     %% Start nodes.
     MaxActiveSize = 3,
 
-    Servers = node_list(1, "server", Config), %% [server],
+    Servers = [server],
 
-    Clients = node_list(?CLIENT_NUMBER, "client", Config), %% client_list(?CLIENT_NUMBER),
+    Clients = client_list(?CLIENT_NUMBER),
 
     Nodes = start(hyparview_manager_low_active_test, Config,
                   [{partisan_peer_service_manager, Manager},
@@ -540,57 +392,63 @@ hyparview_manager_low_active_test(Config) ->
                    {servers, Servers},
                    {clients, Clients}]),
 
-    CheckStartedFun = fun() ->
-                        case hyparview_membership_check(Nodes) of
-                            {[], []} -> true;
-                            {ConnectedFails, []} ->
-                                {false, {connected_check_failed, ConnectedFails}};
-                            {[], SymmetryFails} ->
-                                {false, {symmetry_check_failed, SymmetryFails}};
-                            {ConnectedFails, SymmetryFails} ->
-                                {false, [{connected_check_failed, ConnectedFails},
-                                         {symmetry_check_failed, SymmetryFails}]}
-                        end
-                      end,
+    %% Pause for clustering.
+    timer:sleep(4000),
 
-    case wait_until(CheckStartedFun, 60 * 2, 100) of
-        ok ->
-            ok;
-        {fail, {false, {connected_check_failed, Nodes}}} ->
-            ct:fail("Graph is not connected, unable to find route between pairs of nodes ~p",
-                    [Nodes]);
-        {fail, {false, {symmetry_check_failed, Nodes}}} ->
-            ct:fail("Symmetry is broken (ie. node1 has node2 in it's view but vice-versa is not true) between the following "
-                    "pairs of nodes: ~p", [Nodes]);
-        {fail, {false, [{connected_check_failed, ConnectedFails},
-                        {symmetry_check_failed, SymmetryFails}]}} ->
-            ct:fail("Graph is not connected, unable to find route between pairs of nodes ~p, symmetry is broken as well"
-                    "(ie. node1 has node2 in it's view but vice-versa is not true) between the following "
-                    "pairs of nodes: ~p", [ConnectedFails, SymmetryFails])
+    %% Create new digraph.
+    Graph = digraph:new(),
+
+    %% Verify membership.
+    %%
+    %% Every node should know about every other node in this topology
+    %% when the active setting is high.
+    %%
+    ConnectFun = fun({_, Node}) ->
+            {ok, ActiveSet} = rpc:call(Node, Manager, active, []),
+            Active = sets:to_list(ActiveSet),
+
+            %% Add vertexes and edges.
+            [connect(Graph, Node, N) || {N, _, _} <- Active]
     end,
 
-    %% Verify forward message functionality.
-    lists:foreach(fun({_Name, Node}) ->
-                    ok = check_forward_message(Node, Manager)
-                  end, Nodes),
+    %% Verify the membership is correct.
+    lists:foreach(ConnectFun, Nodes),
 
-    %% Verify correct behaviour when a node is stopped
-    {_, KilledNode} = N0 = random(Nodes, []),
-    ok = rpc:call(KilledNode, partisan, stop, []),
-    CheckStoppedFun = fun() ->
-                        case hyparview_check_stopped_member(KilledNode, Nodes -- [N0]) of
-                            [] -> true;
-                            FailedNodes ->
-                                FailedNodes
-                        end
-                      end,
-    case wait_until(CheckStoppedFun, 60 * 2, 100) of
-        ok ->
-            ok;
-        {fail, FailedNodes} ->
-            ct:fail("~p has been killed, it should not be in membership of nodes ~p",
-                    [KilledNode, FailedNodes])
-    end,
+    %% Verify connectedness.
+    ConnectedFun = fun({_Name, Node}=Myself) ->
+                        lists:foreach(fun({_, N}) ->
+                                           Path = digraph:get_short_path(Graph, Node, N),
+                                           case Path of
+                                               false ->
+                                                   ct:fail("Graph is not connected!");
+                                               _ ->
+                                                   ok
+                                           end
+                                      end, Nodes -- [Myself])
+                 end,
+    lists:foreach(ConnectedFun, Nodes),
+
+    %% Verify symmetry.
+    SymmetryFun = fun({_, Node1}) ->
+                          %% Get first nodes active set.
+                          {ok, ActiveSet1} = rpc:call(Node1, Manager, active, []),
+                          Active1 = sets:to_list(ActiveSet1),
+
+                          lists:foreach(fun({Node2, _, _}) ->
+                                                %% Get second nodes active set.
+                                                {ok, ActiveSet2} = rpc:call(Node2, Manager, active, []),
+                                                Active2 = sets:to_list(ActiveSet2),
+
+                                                case lists:member(Node1, [N || {N, _, _} <- Active2]) of
+                                                    true ->
+                                                        ok;
+                                                    false ->
+                                                        ct:fail("~p has ~p in it's view but ~p does not have ~p in its view",
+                                                                [Node1, Node2, Node2, Node1])
+                                                end
+                                        end, Active1)
+                  end,
+    lists:foreach(SymmetryFun, Nodes),
 
     %% Stop nodes.
     stop(Nodes),
@@ -602,67 +460,73 @@ hyparview_manager_high_client_test(Config) ->
     Manager = partisan_hyparview_peer_service_manager,
 
     %% Start clients,.
-    Clients = node_list(11, "client", Config), %% client_list(11),
+    Clients = client_list(11),
 
     %% Start servers.
-    Servers = node_list(1, "server", Config), %% [server],
+    Servers = [server],
 
     Nodes = start(hyparview_manager_low_active_test, Config,
                   [{partisan_peer_service_manager, Manager},
                    {servers, Servers},
                    {clients, Clients}]),
 
-    CheckStartedFun = fun() ->
-                        case hyparview_membership_check(Nodes) of
-                            {[], []} -> true;
-                            {ConnectedFails, []} ->
-                                {false, {connected_check_failed, ConnectedFails}};
-                            {[], SymmetryFails} ->
-                                {false, {symmetry_check_failed, SymmetryFails}};
-                            {ConnectedFails, SymmetryFails} ->
-                                {false, [{connected_check_failed, ConnectedFails},
-                                         {symmetry_check_failed, SymmetryFails}]}
-                        end
-                      end,
+    %% Pause for clustering.
+    timer:sleep(9000),
 
-    case wait_until(CheckStartedFun, 60 * 2, 100) of
-        ok ->
-            ok;
-        {fail, {false, {connected_check_failed, Nodes}}} ->
-            ct:fail("Graph is not connected, unable to find route between pairs of nodes ~p",
-                    [Nodes]);
-        {fail, {false, {symmetry_check_failed, Nodes}}} ->
-            ct:fail("Symmetry is broken (ie. node1 has node2 in it's view but vice-versa is not true) between the following "
-                    "pairs of nodes: ~p", [Nodes]);
-        {fail, {false, [{connected_check_failed, ConnectedFails},
-                        {symmetry_check_failed, SymmetryFails}]}} ->
-            ct:fail("Graph is not connected, unable to find route between pairs of nodes ~p, symmetry is broken as well"
-                    "(ie. node1 has node2 in it's view but vice-versa is not true) between the following "
-                    "pairs of nodes: ~p", [ConnectedFails, SymmetryFails])
-    end,
-    
-    %% Verify forward message functionality.
-    lists:foreach(fun({_Name, Node}) ->
-                    ok = check_forward_message(Node, Manager)
-                  end, Nodes),
+    %% Create new digraph.
+    Graph = digraph:new(),
 
-    %% Verify correct behaviour when a node is stopped
-    {_, KilledNode} = N0 = random(Nodes, []),
-    ok = rpc:call(KilledNode, partisan, stop, []),
-    CheckStoppedFun = fun() ->
-                        case hyparview_check_stopped_member(KilledNode, Nodes -- [N0]) of
-                            [] -> true;
-                            FailedNodes ->
-                                FailedNodes
-                        end
-                      end,
-    case wait_until(CheckStoppedFun, 60 * 2, 100) of
-        ok ->
-            ok;
-        {fail, FailedNodes} ->
-            ct:fail("~p has been killed, it should not be in membership of nodes ~p",
-                    [KilledNode, FailedNodes])
-    end,
+    %% Verify membership.
+    %%
+    %% Every node should know about every other node in this topology
+    %% when the active setting is high.
+    %%
+    ConnectFun = fun({_, Node}) ->
+        {ok, ActiveSet} = rpc:call(Node, Manager, active, []),
+        Active = sets:to_list(ActiveSet),
+
+        %% Add vertexes and edges.
+        [connect(Graph, Node, N) || {N, _, _} <- Active]
+                 end,
+
+    %% Verify the membership is correct.
+    lists:foreach(ConnectFun, Nodes),
+
+    %% Verify connectedness.
+    ConnectedFun = fun({_Name, Node}=Myself) ->
+        lists:foreach(fun({_, N}) ->
+            Path = digraph:get_short_path(Graph, Node, N),
+            case Path of
+                false ->
+                    ct:fail("Graph is not connected!");
+                _ ->
+                    ok
+            end
+                      end, Nodes -- [Myself])
+                   end,
+    lists:foreach(ConnectedFun, Nodes),
+
+    %% Verify symmetry.
+    SymmetryFun = fun({_, Node1}) ->
+        %% Get first nodes active set.
+        {ok, ActiveSet1} = rpc:call(Node1, Manager, active, []),
+        Active1 = sets:to_list(ActiveSet1),
+
+        lists:foreach(fun({Node2, _, _}) ->
+            %% Get second nodes active set.
+            {ok, ActiveSet2} = rpc:call(Node2, Manager, active, []),
+            Active2 = sets:to_list(ActiveSet2),
+
+            case lists:member(Node1, [N || {N, _, _} <- Active2]) of
+                true ->
+                    ok;
+                false ->
+                    ct:fail("~p has ~p in it's view but ~p does not have ~p in its view",
+                            [Node1, Node2, Node2, Node1])
+            end
+                      end, Active1)
+                  end,
+    lists:foreach(SymmetryFun, Nodes),
 
     %% Stop nodes.
     stop(Nodes),
@@ -675,12 +539,12 @@ hyparview_manager_high_client_test(Config) ->
 %% ===================================================================
 
 %% @private
-start(_Case, Config, Options) ->
+start(_Case, _Config, Options) ->
     %% Launch distribution for the test runner.
     ct:pal("Launching Erlang distribution..."),
 
-    {ok, Hostname} = inet:gethostname(), 
     os:cmd(os:find_executable("epmd") ++ " -daemon"),
+    {ok, Hostname} = inet:gethostname(),
     case net_kernel:start([list_to_atom("runner@" ++ Hostname), shortnames]) of
         {ok, _} ->
             ok;
@@ -747,7 +611,7 @@ start(_Case, Config, Options) ->
     ConfigureFun = fun({Name, Node}) ->
             %% Configure the peer service.
             PeerService = proplists:get_value(partisan_peer_service_manager, Options),
-            ct:pal("Setting peer service manager on node ~p to ~p", [Node, PeerService]),
+            ct:pal("Setting peer service maanger on node ~p to ~p", [Node, PeerService]),
             ok = rpc:call(Node, partisan_config, set,
                           [partisan_peer_service_manager, PeerService]),
 
@@ -755,35 +619,13 @@ start(_Case, Config, Options) ->
             ok = rpc:call(Node, partisan_config, set,
                           [max_active_size, MaxActiveSize]),
 
-            ok = rpc:call(Node, application, set_env, [partisan, peer_ip, ?PEER_IP]),
-
-            Channels = case ?config(channels, Config) of
-                              undefined ->
-                                  ?CHANNELS;
-                              C ->
-                                  C
-                          end,
-            ct:pal("Setting channels to: ~p", [Channels]),
-            ok = rpc:call(Node, partisan_config, set, [channels, Channels]),
-
-            ok = rpc:call(Node, partisan_config, set, [tls, ?config(tls, Config)]),
-            Parallelism = case ?config(parallelism, Config) of
-                              undefined ->
-                                  ?PARALLELISM;
-                              P ->
-                                  P
-                          end,
-            ct:pal("Setting parallelism to: ~p", [Parallelism]),
-            ok = rpc:call(Node, partisan_config, set, [parallelism, Parallelism]),
-
             Servers = proplists:get_value(servers, Options, []),
             Clients = proplists:get_value(clients, Options, []),
 
             %% Configure servers.
             case lists:member(Name, Servers) of
                 true ->
-                    ok = rpc:call(Node, partisan_config, set, [tag, server]),
-                    ok = rpc:call(Node, partisan_config, set, [tls_options, ?config(tls_server_opts, Config)]);
+                    ok = rpc:call(Node, partisan_config, set, [tag, server]);
                 false ->
                     ok
             end,
@@ -791,40 +633,23 @@ start(_Case, Config, Options) ->
             %% Configure clients.
             case lists:member(Name, Clients) of
                 true ->
-                    ok = rpc:call(Node, partisan_config, set, [tag, client]),
-                    ok = rpc:call(Node, partisan_config, set, [tls_options, ?config(tls_client_opts, Config)]);
+                    ok = rpc:call(Node, partisan_config, set, [tag, client]);
                 false ->
                     ok
             end
     end,
-    lists:foreach(ConfigureFun, Nodes),
+    lists:map(ConfigureFun, Nodes),
 
     ct:pal("Starting nodes."),
 
     StartFun = fun({_Name, Node}) ->
                         %% Start partisan.
-                        {ok, _} = rpc:call(Node, application, ensure_all_started, [partisan]),
-                        %% Start a dummy registered process that saves in the environment
-                        %% whatever message it gets, it will only do this *x* amount of times
-                        %% *x* being the number of nodes present in the cluster
-                        Pid = rpc:call(Node, erlang, spawn,
-                                       [fun() ->
-                                            lists:foreach(fun(_) ->
-                                                receive
-                                                    {store, N} ->
-                                                        %% save the number in the environment
-                                                        application:set_env(partisan, forward_message_test, N)
-                                                end
-                                            end, lists:seq(1, length(NodeNames)))
-                                        end]),
-                        true = rpc:call(Node, erlang, register, [store_proc, Pid]),
-                        ct:pal("registered store_proc on pid ~p, node ~p",
-                               [Pid, Node])
-               end,
-    lists:foreach(StartFun, Nodes),
+                        {ok, _} = rpc:call(Node, application, ensure_all_started, [partisan])
+                   end,
+    lists:map(StartFun, Nodes),
 
     ct:pal("Clustering nodes."),
-    lists:foreach(fun(Node) -> cluster(Node, Nodes, Options, Config) end, Nodes),
+    lists:map(fun(Node) -> cluster(Node, Nodes, Options) end, Nodes),
 
     ct:pal("Partisan fully initialized."),
 
@@ -853,7 +678,7 @@ codepath() ->
 %% client/server topology, which requires all nodes talk to every other
 %% node to correctly compute the overlay.
 %%
-cluster({Name, _Node} = Myself, Nodes, Options, Config) when is_list(Nodes) ->
+cluster({Name, _Node} = Myself, Nodes, Options) when is_list(Nodes) ->
     Manager = proplists:get_value(partisan_peer_service_manager, Options),
 
     Servers = proplists:get_value(servers, Options, []),
@@ -891,46 +716,23 @@ cluster({Name, _Node} = Myself, Nodes, Options, Config) when is_list(Nodes) ->
                                omit([Name], Nodes)
                         end
                  end,
-    lists:map(fun(OtherNode) -> cluster(Myself, OtherNode, Config) end, OtherNodes).
-cluster({_, Node}, {_, OtherNode}, Config) ->
+    lists:map(fun(OtherNode) -> cluster(Myself, OtherNode) end, OtherNodes).
+cluster({_, Node}, {_, OtherNode}) ->
     PeerPort = rpc:call(OtherNode,
                         partisan_config,
                         get,
                         [peer_port, ?PEER_PORT]),
-    Parallelism = case ?config(parallelism, Config) of
-                      undefined ->
-                          1;
-                      P ->
-                          P
-                  end,
-    Channels = case ?config(channels, Config) of
-                      undefined ->
-                          [];
-                      C ->
-                          C
-                  end,
-    JoinMethod = case ?config(sync_join, Config) of
-                  undefined ->
-                      join;
-                  true ->
-                      sync_join
-                  end,
     ct:pal("Joining node: ~p to ~p at port ~p", [Node, OtherNode, PeerPort]),
     ok = rpc:call(Node,
                   partisan_peer_service,
-                  JoinMethod,
-                  [#{name => OtherNode,
-                     listen_addrs => [#{ip => {127, 0, 0, 1}, port => PeerPort}],
-                     channels => Channels,
-                     parallelism => Parallelism}]).
+                  join,
+                  [{OtherNode, {127, 0, 0, 1}, PeerPort}]).
 
 %% @private
 stop(Nodes) ->
     StopFun = fun({Name, _Node}) ->
         case ct_slave:stop(Name) of
             {ok, _} ->
-                ok;
-            {error, stop_timeout, _} ->
                 ok;
             Error ->
                 ct:fail(Error)
@@ -956,168 +758,11 @@ connect(G, N1, N2) ->
     ok.
 
 %% @private
-node_list(0, _Name, _Config) -> 
-    [];
-node_list(N, Name, Config) ->
-    [ list_to_atom(string:join([Name,
-                                integer_to_list(?config(hash, Config)),
-                                integer_to_list(X)],
-                               "_")) ||
-        X <- lists:seq(1, N) ].
+node_list(ClientNumber) ->
+    Clients = client_list(ClientNumber),
+    [server | Clients].
 
 %% @private
-make_certs(Config) ->
-    DataDir = ?config(data_dir, Config),
-    PrivDir = ?config(priv_dir, Config),
-    ct:pal("Generating TLS certificates into ~s", [PrivDir]),
-    MakeCertsFile = filename:join(DataDir, "make_certs.erl"),
-    {ok, make_certs, ModBin} = compile:file(MakeCertsFile, 
-        [binary, debug_info, report_errors, report_warnings]),
-    {module, make_certs} = code:load_binary(make_certs, MakeCertsFile, ModBin),
-
-    make_certs:all(DataDir, PrivDir),
-
-    [{tls_server_opts,
-      [
-       {certfile, filename:join(PrivDir, "server/keycert.pem")},
-       {cacertfile, filename:join(PrivDir, "server/cacerts.pem")}
-      ]},
-     {tls_client_opts,
-      [
-       {certfile, filename:join(PrivDir, "client/keycert.pem")},
-       {cacertfile, filename:join(PrivDir, "client/cacerts.pem")}
-      ]}].
-
-%% @private
-check_forward_message(Node, Manager) ->
-    {ok, Members} = rpc:call(Node, Manager, members, []),
-    %% ask member node to forward a message to one other random member
-    ct:pal("members of ~p: ~p", [Node, Members]),
-    RandomMember = random(Members, Node),
-    ct:pal("requesting node ~p to forward message to store_proc on node ~p",
-           [Node, RandomMember]),
-    Rand = rand_compat:uniform(),
-    ok = rpc:call(Node, Manager, forward_message,
-                  [RandomMember, store_proc, {store, Rand}]),
-    %% now fetch the value from the random destination node
-    ok = wait_until(fun() ->
-                    %% it must match with what we asked the node to forward
-                    case rpc:call(RandomMember, application, get_env, [partisan, forward_message_test]) of
-                        {ok, R} ->
-                            R =:= Rand;
-                        _ ->
-                            false
-                    end
-               end, 60 * 2, 500),
-
-    ok.
-
-random(List0, Omit) ->
-    List = List0 -- lists:flatten([Omit]),
-    %% Catch exceptions where there may not be enough members.
-    try
-        Index = rand_compat:uniform(length(List)),
-        lists:nth(Index, List)
-    catch
-        _:_ ->
-            undefined
-    end.
-
-wait_until(Fun, Retry, Delay) when Retry > 0 ->
-    Res = Fun(),
-    case Res of
-        true ->
-            ok;
-        _ when Retry == 1 ->
-            {fail, Res};
-        _ ->
-            timer:sleep(Delay),
-            wait_until(Fun, Retry-1, Delay)
-    end.
-
-%% @private
-%% 
-%% Kill a random node and then return a list of nodes that still have the
-%% killed node in their membership
-%%
-hyparview_check_stopped_member(_, [_Node]) -> {undefined, []};
-hyparview_check_stopped_member(KilledNode, Nodes) ->
-    %% Obtain the membership from all the nodes,
-    %% the killed node shouldn't be there
-    lists:filtermap(fun({_, Node}) ->
-                        {ok, Members} = rpc:call(Node, partisan_peer_service, members, []),
-                        case lists:member(KilledNode, Members) of
-                            true ->
-                                {true, Node};
-                            false ->
-                                false
-                        end
-                     end, Nodes).
-
-%% @private
-hyparview_membership_check(Nodes) ->
-    Manager = partisan_hyparview_peer_service_manager,
-    %% Create new digraph.
-    Graph = digraph:new(),
-
-    %% Verify membership.
-    %%
-    %% Every node should know about every other node in this topology
-    %% when the active setting is high.
-    %%
-    ConnectFun =
-        fun({_, Node}) ->
-            {ok, ActiveSet} = rpc:call(Node, Manager, active, []),
-            Active = sets:to_list(ActiveSet),
-
-            %% Add vertexes and edges.
-            [connect(Graph, Node, N) || #{name := N} <- Active]
-         end,
-    %% Build a digraph representing the membership
-    lists:foreach(ConnectFun, Nodes),
-
-    %% Verify connectedness.
-    %% Return a list of node tuples that were found not to be connected,
-    %% empty otherwise
-    ConnectedFails =
-        lists:flatmap(fun({_Name, Node}=Myself) ->
-                lists:filtermap(fun({_, N}) ->
-                    Path = digraph:get_short_path(Graph, Node, N),
-                    case Path of
-                        false ->
-                            %% print out the active view of each node
-                            lists:foreach(fun({_, N1}) ->
-                                                {ok, ActiveSet} = rpc:call(N1, Manager, active, []),
-                                                Active = sets:to_list(ActiveSet),
-                                                ct:pal("node ~p active view: ~p",
-                                                       [N1, Active])
-                                           end, Nodes),
-                            {true, {Node, N}};
-                        _ ->
-                            false
-                    end
-                 end, Nodes -- [Myself])
-            end, Nodes),
-
-    %% Verify symmetry.
-    SymmetryFails =
-        lists:flatmap(fun({_, Node1}) ->
-                %% Get first nodes active set.
-                {ok, ActiveSet1} = rpc:call(Node1, Manager, active, []),
-                Active1 = sets:to_list(ActiveSet1),
-
-                lists:filtermap(fun(#{name := Node2}) ->
-                    %% Get second nodes active set.
-                    {ok, ActiveSet2} = rpc:call(Node2, Manager, active, []),
-                    Active2 = sets:to_list(ActiveSet2),
-
-                    case lists:member(Node1, [N || #{name := N} <- Active2]) of
-                        true ->
-                            false;
-                        false ->
-                            {true, {Node1, Node2}}
-                    end
-                end, Active1)
-            end, Nodes),
-
-    {ConnectedFails, SymmetryFails}.
+client_list(0) -> [];
+client_list(N) -> lists:append(client_list(N - 1),
+                               [list_to_atom("client_" ++ integer_to_list(N))]).

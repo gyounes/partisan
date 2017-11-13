@@ -22,7 +22,6 @@
 -author("Christopher S. Meiklejohn <christopher.meiklejohn@gmail.com>").
 
 -include("partisan.hrl").
--include("partisan_peer_connection.hrl").
 
 -behaviour(acceptor).
 -behaviour(gen_server).
@@ -40,26 +39,22 @@
          terminate/2,
          code_change/3]).
 
--record(state, {
-          socket :: partisan_peer_connection:connection(),
-          ref :: reference()
-         }).
+-record(state, {socket, ref}).
 
 -type state_t() :: #state{}.
 
 acceptor_init(_SockName, LSocket, []) ->
-    %% monitor listen socket to gracefully close when it closes
+    % monitor listen socket to gracefully close when it closes
     MRef = monitor(port, LSocket),
     {ok, MRef}.
 
-acceptor_continue(_PeerName, Socket0, MRef) ->
-    Socket = partisan_peer_connection:accept(Socket0),
+acceptor_continue(_PeerName, Socket, MRef) ->
     send_message(Socket, {hello, node()}),
     gen_server:enter_loop(?MODULE, [], #state{socket=Socket, ref=MRef}).
 
 acceptor_terminate(Reason, _) ->
-    %% Something went wrong. Either the acceptor_pool is terminating
-    %% or the accept failed.
+    % Something went wrong. Either the acceptor_pool is terminating or the
+    % accept failed.
     exit(Reason).
 
 %% gen_server api
@@ -73,21 +68,20 @@ handle_call(Req, _, State) ->
 handle_cast(Req, State) ->
     {stop, {bad_cast, Req}, State}.
 
-handle_info({Tag, _RawSocket, Data}, State=#state{socket=Socket}) when ?DATA_MSG(Tag) ->
+handle_info({tcp, Socket, Data}, State=#state{socket=Socket}) ->
     handle_message(decode(Data), State),
-    ok = partisan_peer_connection:setopts(Socket, [{active, once}]),
+    ok = inet:setopts(Socket, [{active, once}]),
     {noreply, State};
-handle_info({Tag, _RawSocket, Reason}, State=#state{socket=Socket}) when ?ERROR_MSG(Tag) ->
-    lager:error("connection socket ~p errored out, closing",
-                [Socket]),
+handle_info({tcp_error, Socket, Reason}, State=#state{socket=Socket}) ->
     {stop, Reason, State};
-handle_info({Tag, _RawSocket}, State=#state{socket=Socket}) when ?CLOSED_MSG(Tag) ->
-    lager:error("connection socket ~p has been remotely closed",
-                [Socket]),
+handle_info({tcp_closed, Socket}, State=#state{socket=Socket}) ->
     {stop, normal, State};
-handle_info({'DOWN', MRef, port, _, _}, State=#state{ref=MRef}) ->
-    %% Listen socket closed
-    {stop, normal, State};
+handle_info({'DOWN', MRef, port, _, _}, State=#state{socket=Socket,
+                                                     ref=MRef}) ->
+    %% Listen socket closed, receive all pending data then stop. In more
+    %% advanced protocols will likely be able to do better.
+    lager:info("Gracefully closing ~p~n", [Socket]),
+    {stop, flush_socket(Socket), State};
 handle_info(_, State) ->
     {noreply, State}.
 
@@ -96,7 +90,7 @@ terminate(_, _) ->
 
 %% @private
 -spec code_change(term() | {down, term()}, state_t(), term()) ->
-                         {ok, state_t()}.
+    {ok, state_t()}.
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
@@ -115,9 +109,8 @@ handle_message({hello, Node},
         ok ->
             %% Send our state to the remote service, incase they want
             %% it to bootstrap.
-            Manager = partisan_peer_service:manager(),
+            Manager = manager(),
             {ok, LocalState} = Manager:get_local_state(),
-            % lager:info("got hello reply from ~p, sending local state", [Node]),
             send_message(Socket, {state, Tag, LocalState}),
             ok;
         error ->
@@ -126,14 +119,14 @@ handle_message({hello, Node},
             ok
     end;
 handle_message(Message, _State) ->
-    Manager = partisan_peer_service:manager(),
+    Manager = manager(),
     Manager:receive_message(Message),
     ok.
 
 %% @private
 send_message(Socket, Message) ->
     EncodedMessage = encode(Message),
-    partisan_peer_connection:send(Socket, EncodedMessage).
+    gen_tcp:send(Socket, EncodedMessage).
 
 %% @private
 encode(Message) ->
@@ -157,3 +150,33 @@ maybe_connect_disterl(Node) ->
             ok
     end.
 
+%% @private
+manager() ->
+    partisan_config:get(partisan_peer_service_manager,
+                        partisan_default_peer_service_manager).
+
+%% internal
+
+flush_socket(Socket) ->
+    receive
+        {tcp, Socket, Data}         -> flush_send(Socket, Data);
+        {tcp_error, Socket, Reason} -> Reason;
+        {tcp_closed, Socket}        -> normal
+    after
+        0                           -> normal
+    end.
+
+flush_send(Socket, Data) ->
+    case gen_tcp:send(Socket, Data) of
+        ok              -> flush_recv(Socket);
+        {error, closed} -> normal;
+        {error, Reason} -> Reason
+    end.
+
+flush_recv(Socket) ->
+    case gen_tcp:recv(Socket, 0, 0) of
+        {ok, Data}       -> flush_send(Socket, Data);
+        {error, timeout} -> normal;
+        {error, closed}  -> normal;
+        {error, Reason}  -> Reason
+end.
