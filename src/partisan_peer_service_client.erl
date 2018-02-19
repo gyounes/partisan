@@ -138,7 +138,7 @@ connect(Peer) when is_atom(Peer) ->
 
 %% @doc Connect to remote peer.
 connect({_Name, Address, Port}) ->
-    Options = [binary, {active, true}, {packet, 4}, {keepalive, true}],
+    Options = [binary, {active, true}, {packet, 4}, {keepalive, true}, {nodelay, true}],
     case gen_tcp:connect(Address, Port, Options, ?TIMEOUT) of
         {ok, Socket} ->
             {ok, Socket};
