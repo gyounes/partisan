@@ -70,14 +70,6 @@ init([Peer, From]) ->
     {reply, term(), state_t()}.
 
 %% @private
-handle_call({send_message, Message}, _From, #state{socket=Socket}=State) ->
-    case gen_tcp:send(Socket, encode(Message)) of
-        ok ->
-            {reply, ok, State};
-        Error ->
-            lager:info("Message failed to send: ~p", [Error]),
-            {reply, Error, State}
-    end;
 handle_call(Msg, _From, State) ->
     lager:warning("Unhandled messages: ~p", [Msg]),
     {reply, ok, State}.
@@ -85,19 +77,18 @@ handle_call(Msg, _From, State) ->
 -spec handle_cast(term(), state_t()) -> {noreply, state_t()}.
 %% @private
 handle_cast({send_message, Message}, #state{socket=Socket}=State) ->
-    case gen_tcp:send(Socket, encode(Message)) of
-        ok ->
-            ok;
-        Error ->
-            lager:info("Message failed to send: ~p", [Error])
-    end,
+    do_send_message(Message, Socket),
     {noreply, State};
+
 handle_cast(Msg, State) ->
     lager:warning("Unhandled messages: ~p", [Msg]),
     {noreply, State}.
 
 %% @private
 -spec handle_info(term(), state_t()) -> {noreply, state_t()}.
+handle_info({send_message, Message}, #state{socket=Socket}=State) ->
+    do_send_message(Message, Socket),
+    {noreply, State};
 handle_info({tcp, _Socket, Data}, State0) ->
     handle_message(decode(Data), State0);
 handle_info({tcp_closed, _Socket}, State) ->
@@ -171,3 +162,11 @@ handle_message(Message, State) ->
 %% @private
 encode(Message) ->
     term_to_binary(Message).
+
+do_send_message(Message, Socket) ->
+    case gen_tcp:send(Socket, encode(Message)) of
+        ok ->
+            ok;
+        Error ->
+            lager:info("Message failed to send: ~p", [Error])
+    end.
