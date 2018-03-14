@@ -11,8 +11,4 @@ script:
   - make test
   - make xref
   - make dialyzer
-notifications:
-  email: christopher.meiklejohn@gmail.com
-  slack: lasp-lang:hiPRNnbUa3zdGrrXZfGRAF7D
-  irc: "irc.freenode.org#lasp-lang"
 sudo: false
