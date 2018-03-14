@@ -36,6 +36,7 @@
          send_message/2,
          forward_message/3,
          cast_message/3,
+         cast_message_with_delay/3,
          receive_message/1,
          decode/1,
          reserve/1,
@@ -97,7 +98,12 @@ forward_message(Name, ServerRef, Message) ->
 
 %% @doc Cast message to registered process on the remote side.
 cast_message(Name, ServerRef, Message) ->
-    gen_server:call(?MODULE, {forward_message, Name, ServerRef, Message}, infinity).
+    gen_server:cast(?MODULE, {cast_message, Name, ServerRef, Message}).
+
+%% @doc
+-spec cast_message_with_delay([{non_neg_integer(), [name()]}], pid(), message()) -> ok.
+cast_message_with_delay(List, ServerRef, Message) ->
+    gen_server:cast(?MODULE, {cast_message_with_delay, List, ServerRef, Message}).
 
 %% @doc Receive message from a remote manager.
 receive_message(Message) ->
@@ -213,9 +219,31 @@ handle_call(Msg, _From, State) ->
 
 %% @private
 -spec handle_cast(term(), state_t()) -> {noreply, state_t()}.
+handle_cast({cast_message, Name, ServerRef, Message}, #state{connections=Connections}=State) ->
+    do_send_message(Name, {forward_message, ServerRef, Message}, Connections),
+    {noreply, State};
+
+handle_cast({cast_message_with_delay, List, ServerRef, Message}, State) ->
+    lists:foreach(
+        fun({Delay, Names}) ->
+            timer:send_after(Delay, {send, Names, ServerRef, Message})
+        end,
+        List
+    ),
+    {noreply, State};
+
 handle_cast(Msg, State) ->
     lager:warning("Unhandled messages: ~p", [Msg]),
     {noreply, State}.
+
+handle_info({send, Names, ServerRef, Message}, #state{connections=Connections}=State) ->
+    lists:foreach(
+        fun(Name) ->
+            do_send_message(Name, {forward_message, ServerRef, Message}, Connections)
+        end,
+        Names
+    ),
+    {noreply, State};
 
 handle_info({'EXIT', From, _Reason}, #state{connections=Connections0}=State) ->
     FoldFun = fun(K, V, AccIn) ->
