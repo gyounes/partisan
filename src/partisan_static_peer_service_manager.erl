@@ -101,9 +101,9 @@ cast_message(Name, ServerRef, Message) ->
     gen_server:cast(?MODULE, {cast_message, Name, ServerRef, Message}).
 
 %% @doc
--spec cast_message_with_delay([{non_neg_integer(), [name()]}], pid(), message()) -> ok.
-cast_message_with_delay(List, ServerRef, Message) ->
-    gen_server:cast(?MODULE, {cast_message_with_delay, List, ServerRef, Message}).
+-spec cast_message_with_delay([{name(), non_neg_integer()}], pid(), message()) -> ok.
+cast_message_with_delay(NameToDelay, ServerRef, Message) ->
+    gen_server:cast(?MODULE, {cast_message_with_delay, NameToDelay, ServerRef, Message}).
 
 %% @doc Receive message from a remote manager.
 receive_message(Message) ->
@@ -223,27 +223,19 @@ handle_cast({cast_message, Name, ServerRef, Message}, #state{connections=Connect
     do_send_message(Name, {forward_message, ServerRef, Message}, Connections),
     {noreply, State};
 
-handle_cast({cast_message_with_delay, List, ServerRef, Message}, State) ->
+handle_cast({cast_message_with_delay, NameToDelay, ServerRef, Message},
+            #state{connections=Connections}=State) ->
     lists:foreach(
-        fun({Delay, Names}) ->
-            timer:send_after(Delay, {send, Names, ServerRef, Message})
+        fun({Name, Delay}) ->
+            do_send_message(Name, {forward_message, ServerRef, Message}, Connections, Delay)
         end,
-        List
+        NameToDelay
     ),
     {noreply, State};
 
 handle_cast(Msg, State) ->
     lager:warning("Unhandled messages: ~p", [Msg]),
     {noreply, State}.
-
-handle_info({send, Names, ServerRef, Message}, #state{connections=Connections}=State) ->
-    lists:foreach(
-        fun(Name) ->
-            do_send_message(Name, {forward_message, ServerRef, Message}, Connections)
-        end,
-        Names
-    ),
-    {noreply, State};
 
 handle_info({'EXIT', From, _Reason}, #state{connections=Connections0}=State) ->
     FoldFun = fun(K, V, AccIn) ->
@@ -415,13 +407,16 @@ handle_message({forward_message, ServerRef, Message}, State) ->
 
 %% @private
 do_send_message(Name, Message, Connections) ->
+    do_send_message(Name, Message, Connections, 0).
+
+do_send_message(Name, Message, Connections, Delay) ->
     %% Find a connection for the remote node, if we have one.
     case dict:find(Name, Connections) of
         {ok, undefined} ->
             %% Node was connected but is now disconnected.
             {error, disconnected};
         {ok, Pid} ->
-            gen_server:cast(Pid, {send_message, Message});
+            timer:send_after(Delay, Pid, {send_message, Message});
         error ->
             %% Node has not been connected yet.
             {error, not_yet_connected}
