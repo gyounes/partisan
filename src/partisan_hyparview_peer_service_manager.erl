@@ -41,6 +41,7 @@
          send_message/2,
          forward_message/3,
          cast_message/3,
+         cast_message_with_delay/3,
          receive_message/1,
          decode/1,
          reserve/1,
@@ -126,7 +127,12 @@ forward_message(Name, ServerRef, Message) ->
 
 %% @doc Cast message to registered process on the remote side.
 cast_message(Name, ServerRef, Message) ->
-    gen_server:call(?MODULE, {forward_message, Name, ServerRef, Message}, infinity).
+    gen_server:cast(?MODULE, {cast_message, Name, ServerRef, Message}).
+
+%% @doc
+-spec cast_message_with_delay([{name(), non_neg_integer()}], pid(), message()) -> ok.
+cast_message_with_delay(NameToDelay, ServerRef, Message) ->
+    gen_server:cast(?MODULE, {cast_message_with_delay, NameToDelay, ServerRef, Message}).
 
 %% @doc Receive message from a remote manager.
 receive_message(Message) ->
@@ -366,6 +372,20 @@ handle_call(Msg, _From, State) ->
 
 %% @private
 -spec handle_cast(term(), state_t()) -> {noreply, state_t()}.
+
+handle_cast({cast_message, Name, ServerRef, Message}, #state{connections=Connections}=State) ->
+    do_send_message(Name, {forward_message, ServerRef, Message}, Connections),
+    {noreply, State};
+
+handle_cast({cast_message_with_delay, NameToDelay, ServerRef, Message},
+            #state{connections=Connections}=State) ->
+    lists:foreach(
+        fun({Name, Delay}) ->
+            do_send_message(Name, {forward_message, ServerRef, Message}, Connections, Delay)
+        end,
+        NameToDelay
+    ),
+    {noreply, State};
 
 handle_cast({join, Peer},
             #state{myself=Myself0,
@@ -1057,6 +1077,11 @@ disconnect(Name, Connections) ->
 
 %% @private
 do_send_message(Name, Message, Connections) when is_atom(Name) ->
+    do_send_message(Name, Message, Connections, 0);
+do_send_message({Name, _, _}, Message, Connections) ->
+    do_send_message(Name, Message, Connections).
+
+do_send_message(Name, Message, Connections, Delay) when is_atom(Name) ->
     %% Find a connection for the remote node, if we have one.
     case dict:find(Name, Connections) of
         {ok, undefined} ->
@@ -1064,7 +1089,9 @@ do_send_message(Name, Message, Connections) when is_atom(Name) ->
             {error, disconnected};
         {ok, Pid} ->
             try
-                gen_server:call(Pid, {send_message, Message})
+                % gen_server:call(Pid, {send_message, Message})
+                timer:send_after(Delay, Pid, {send_message, Message}),
+                ok
             catch
                 _:Error ->
                     lager:info("Fail to send a message to ~p: ~p", [Name, Error]),
@@ -1074,8 +1101,8 @@ do_send_message(Name, Message, Connections) when is_atom(Name) ->
             %% Node has not been connected yet.
             {error, not_yet_connected}
     end;
-do_send_message({Name, _, _}, Message, Connections) ->
-    do_send_message(Name, Message, Connections).
+do_send_message({Name, _, _}, Message, Connections, Delay) ->
+    do_send_message(Name, Message, Connections, Delay).
 
 %% @private
 select_random(View, Omit) ->

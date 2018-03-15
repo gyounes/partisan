@@ -36,6 +36,7 @@
          send_message/2,
          forward_message/3,
          cast_message/3,
+         cast_message_with_delay/3,
          receive_message/1,
          decode/1,
          reserve/1,
@@ -101,6 +102,11 @@ forward_message(Name, ServerRef, Message) ->
 %% @doc Cast message to registered process on the remote side.
 cast_message(Name, ServerRef, Message) ->
     gen_server:cast(?MODULE, {cast_message, Name, ServerRef, Message}).
+
+%% @doc
+-spec cast_message_with_delay([{name(), non_neg_integer()}], pid(), message()) -> ok.
+cast_message_with_delay(NameToDelay, ServerRef, Message) ->
+    gen_server:cast(?MODULE, {cast_message_with_delay, NameToDelay, ServerRef, Message}).
 
 %% @doc Receive message from a remote manager.
 receive_message(Message) ->
@@ -256,6 +262,16 @@ handle_call(Msg, _From, State) ->
 
 handle_cast({cast_message, Name, ServerRef, Message}, #state{connections=Connections}=State) ->
     do_send_message(Name, {forward_message, ServerRef, Message}, Connections),
+    {noreply, State};
+
+handle_cast({cast_message_with_delay, NameToDelay, ServerRef, Message},
+            #state{connections=Connections}=State) ->
+    lists:foreach(
+        fun({Name, Delay}) ->
+            do_send_message(Name, {forward_message, ServerRef, Message}, Connections, Delay)
+        end,
+        NameToDelay
+    ),
     {noreply, State};
 
 handle_cast(Msg, State) ->
@@ -537,13 +553,16 @@ random_peers(Peers, Fanout) ->
 
 %% @private
 do_send_message(Name, Message, Connections) ->
+    do_send_message(Name, Message, Connections, 0).
+
+do_send_message(Name, Message, Connections, Delay) ->
     %% Find a connection for the remote node, if we have one.
     case dict:find(Name, Connections) of
         {ok, undefined} ->
             %% Node was connected but is now disconnected.
             {error, disconnected};
         {ok, Pid} ->
-            gen_server:cast(Pid, {send_message, Message});
+            timer:send_after(Delay, Pid, {send_message, Message});
         error ->
             %% Node has not been connected yet.
             {error, not_yet_connected}
