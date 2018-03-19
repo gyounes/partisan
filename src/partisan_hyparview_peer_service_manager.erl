@@ -130,7 +130,6 @@ cast_message(Name, ServerRef, Message) ->
     gen_server:cast(?MODULE, {cast_message, Name, ServerRef, Message}).
 
 %% @doc
--spec cast_message_with_delay([{name(), non_neg_integer()}], pid(), message()) -> ok.
 cast_message_with_delay(NameToDelay, ServerRef, Message) ->
     gen_server:cast(?MODULE, {cast_message_with_delay, NameToDelay, ServerRef, Message}).
 
